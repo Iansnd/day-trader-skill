@@ -552,6 +552,118 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
     return res
 
 
+# ---------------------------------------------------------------- jev (logged scorer)
+#
+# TypeSafe Jev, a System 1 decision model, answers one noul question per setup:
+# P(this long setup reaches its target before its stop). It is a SCORER, not a
+# gate: the bar-by-bar logic above still decides "triggered". The probability
+# rides along in trader/entry.json (exit.py copies it into trader/plan.json) and
+# every score is appended to trader/state/jev_scores.jsonl so it can be
+# calibrated against outcomes before anyone lets it block an entry.
+#
+# Off unless trader/config.json has {"jev": {"enabled": true}} AND JEV_API_KEY
+# is set. Direct HTTP to the official endpoint; no gateway, no SDK.
+# Wire format (docs.typesafe.ai/primitives/noul): POST {state, model, questions}
+# -> {"model": "jev-1.13.0", "answers": {"works": {"type": "noul", "noul": 0.93}}, "usage": {...}}
+
+JEV_URL = "https://api.typesafe.ai/v1/systemone"
+JEV_DEFAULTS = {"enabled": False, "model": "jev-latest", "timeout": 3, "workers": 16,
+                "log": "trader/state/jev_scores.jsonl"}
+JEV_QUESTION = ("This is a long-only intraday setup on a US stock. Will a buy at the trigger price "
+                "reach the plan's target before it hits the stop today?")
+JEV_CRITERIA = {"true": "clean close above the level, volume at or above the range bars, early in the "
+                        "session, range not already extended",
+                "false": "late trigger, weak volume, price far above the level already, or the setup expired"}
+
+
+HALT = "Execution halted: Macro conditions hostile to breakouts."
+
+
+def jev_settings(config_path):
+    cfg = dict(JEV_DEFAULTS)
+    try:
+        with open(config_path, encoding="utf-8") as fh:
+            doc = json.load(fh)
+        cfg.update(doc.get("jev") or {})
+        cfg["market_regime"] = doc.get("market_regime")  # written by trader-scanner/regime.py
+    except (OSError, ValueError):
+        pass
+    cfg["key"] = os.environ.get("JEV_API_KEY")
+    return cfg
+
+
+def jev_state(res):
+    """The snapshot Jev judges: the public result minus the bar list, compact JSON."""
+    keep = ("symbol", "setup", "date", "now", "status", "phase", "reason", "opening_range", "level",
+            "trigger", "last", "interval", "or_minutes")
+    return json.dumps({k: res.get(k) for k in keep if res.get(k) is not None}, separators=(",", ":"))
+
+
+def jev_ask(cfg, state, opener=None):
+    body = json.dumps({"state": state, "model": cfg["model"],
+                       "questions": {"works": {"type": "noul", "instructions": JEV_QUESTION,
+                                               "criteria": JEV_CRITERIA}}}).encode("utf-8")
+    req = urllib.request.Request(JEV_URL, data=body, method="POST",
+                                 headers={"Authorization": "Bearer " + cfg["key"],
+                                          "Content-Type": "application/json", "User-Agent": "trader-entry/jev"})
+    t0 = time.time()
+    with (opener or urllib.request.urlopen)(req, timeout=cfg["timeout"]) as r:
+        doc = json.loads(r.read().decode("utf-8"))
+    p = float(doc["answers"]["works"]["noul"])        # the native noul float, 0..1
+    if not 0.0 <= p <= 1.0:
+        raise ValueError("noul out of range: %r" % p)
+    return {"p_works": round(p, 4), "model": doc.get("model", cfg["model"]),
+            "latency_ms": int((time.time() - t0) * 1000)}
+
+
+def jev_log(path, res, out):
+    if not path:
+        return
+    d = os.path.dirname(path)
+    if d:
+        os.makedirs(d, exist_ok=True)
+    t = res.get("trigger") or {}
+    row = {"symbol": res.get("symbol"), "date": res.get("date"), "status": res.get("status"),
+           "setup": res.get("setup"), "trigger_time": t.get("time"), "trigger_price": t.get("price"),
+           "outcome": None}       # filled later by trader-alerts/broker: "target", "stop" or "flat"
+    row.update(out)
+    with open(path, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(row) + "\n")
+
+
+def jev_score(res, cfg, opener=None):
+    """P(setup works) for one evaluate() result; None when off. A failure is
+    logged as {"p_works": null, "error": ...} so the audit shows the gap."""
+    if not cfg.get("enabled") or not cfg.get("key"):
+        return None
+    try:
+        out = jev_ask(cfg, jev_state(res), opener)
+    except (urllib.error.URLError, OSError, KeyError, ValueError, TypeError) as e:
+        out = {"p_works": None, "error": str(e)[:200]}
+    out["asked_at"] = iso(utc_now())
+    jev_log(cfg.get("log"), res, out)
+    return out
+
+
+def jev_attach(results, config_path, opener=None):
+    """Score many evaluate() results concurrently and set res["jev"]. This is
+    where Jev's 70-220 ms matters: the whole watchlist is one round trip."""
+    cfg = jev_settings(config_path)
+    if not cfg.get("enabled") or not cfg.get("key"):
+        return results
+    if cfg.get("market_regime") == "RISK_OFF":  # the macro gate: no Jev call at all
+        print(HALT, file=sys.stderr)
+        for r in results:
+            r["jev"] = {"p_works": None, "halted": HALT}
+        return results
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=max(1, int(cfg.get("workers", 16)))) as ex:
+        for r, out in zip(results, ex.map(lambda r: jev_score(r, cfg, opener), results)):
+            if out is not None:
+                r["jev"] = out
+    return results
+
+
 def public(res):
     """The result without the internal bar list, ready for JSON."""
     return {k: v for k, v in res.items() if not k.startswith("_")}
@@ -566,7 +678,8 @@ def entry_doc(res, now_utc):
             "bar_index": t.get("bar_index"), "price": t.get("price"), "level": res.get("level"),
             "interval": res["interval"],
             "opening_range": {"high": orr["high"], "low": orr["low"], "minutes": orr["minutes"]} if orr else None,
-            "source": "yahoo", "checked_at": iso(now_utc), "reason": res.get("reason")}
+            "source": "yahoo", "checked_at": iso(now_utc), "reason": res.get("reason"),
+            "jev": res.get("jev")}
 
 
 def write_json(path, doc):
@@ -810,6 +923,7 @@ def cmd_check(a):
     sym = a.symbol.upper()
     chart, now = _load(a, sym, parse_now(a.now) if a.now else None)
     res = evaluate(chart, now, **opts)
+    jev_attach([res], a.config)
     if a.write:
         write_json(a.write, entry_doc(res, now))
     if a.json:
@@ -847,6 +961,7 @@ def cmd_watch(a):
         until = datetime.datetime.combine(to_eastern(now_fn()).date(), t)
 
     def on_trigger(res, now):
+        jev_attach([res], a.config)
         write_json(a.out, entry_doc(res, now))
         print("Wrote %s." % a.out, flush=True)
 
@@ -889,10 +1004,11 @@ def cmd_watchlist(a):
             rows.append((sym, evaluate(chart, when, **o), None))
         except EntryError as e:
             rows.append((sym, None, str(e)))
+    jev_attach([r for _, r, _ in rows if r], a.config)
     if a.json:
         print(json.dumps([{"symbol": s, "result": public(r) if r else None, "error": e} for s, r, e in rows], indent=2))
     else:
-        print("%-6s  %-9s  %-8s  %-8s  %-9s  %-9s  %s" % ("SYMBOL", "STATUS", "TIME", "PRICE", "LEVEL", "LAST", "VS LEVEL"))
+        print("%-6s  %-9s  %-5s  %-8s  %-8s  %-9s  %-9s  %s" % ("SYMBOL", "STATUS", "JEV", "TIME", "PRICE", "LEVEL", "LAST", "VS LEVEL"))
         for s, r, e in rows:
             if e:
                 print("%-6s  error: %s" % (s, e))
@@ -900,8 +1016,9 @@ def cmd_watchlist(a):
             t = r.get("trigger") or {}
             last = r.get("last") or {}
             status = SHORT.get(r["phase"], r["status"]) if r["status"] != "triggered" else "triggered"
-            print("%-6s  %-9s  %-8s  %-8s  %-9s  %-9s  %s" % (
-                s, status[:9], t.get("time") or "-", ("$%.2f" % t["price"]) if t else "-",
+            jp = (r.get("jev") or {}).get("p_works")
+            print("%-6s  %-9s  %-5s  %-8s  %-8s  %-9s  %-9s  %s" % (
+                s, status[:9], ("%.2f" % jp) if jp is not None else "-", t.get("time") or "-", ("$%.2f" % t["price"]) if t else "-",
                 ("$%.2f" % r["level"]) if r.get("level") is not None else "-",
                 ("$%.2f" % last["close"]) if last else "-",
                 ("%+.2f%%" % last["vs_level_pct"]) if last.get("vs_level_pct") is not None else "-"))

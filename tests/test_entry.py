@@ -574,7 +574,7 @@ class Cli(unittest.TestCase):
         code, text, _ = run(["watchlist", "--offline", "charts", "--now", "2026-10-19 10:15"])
         self.assertEqual(code, 0)
         rows = text.splitlines()
-        self.assertTrue(rows[1].startswith("TSLA    triggered  10:15 AM  $364.18   $362.18"), rows[1])
+        self.assertTrue(rows[1].startswith("TSLA    triggered  -      10:15 AM  $364.18   $362.18"), rows[1])
         self.assertIn("ZZZZ    error: no offline file", rows[2])
         self.assertIn("DEMO    error: DEMO has 1m bars", rows[3])
         self.assertIn("1 of 3 triggered", text)

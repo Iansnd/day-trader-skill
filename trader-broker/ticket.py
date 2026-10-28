@@ -40,6 +40,8 @@ import json
 import os
 import re
 import sys
+import urllib.error
+import urllib.request
 
 ALPACA_FIELDS = ("symbol", "side", "qty", "notional", "type", "time_in_force", "limit_price",
                  "stop_price", "trail_price", "trail_percent", "extended_hours", "client_order_id",
@@ -323,7 +325,46 @@ def risk_verdict(risk, fp, today):
     return None, "this exact order was not in the last risk check (it changed or is new); run check.py again"
 
 
-def status_of(order, risk, state, today):
+# ---------------------------------------------------------------- ibkr bridge guard
+
+IBKR_MCP = "https://api.ibkr.com/v1/api/mcp"
+IBKR_GATEWAY_AUTH = "https://localhost:5000/v1/api/iserver/auth/status"
+
+
+def ibkr_guard(cfg, opener=None, timeout=4):
+    """(ok, message). Before any IBKR draft is marked READY:
+      1. api.ibkr.com answers: the hosted MCP bridge is reachable from this machine.
+      2. If cfg["ibkr_auth_url"] is set (Client Portal Gateway, default URL above when
+         "ibkr_gateway": true), that session must report authenticated: true.
+    The hosted connector's OAuth session lives inside Claude, not in this process, so
+    step 1 proves the bridge is up, not that Claude is logged in. Claude's own tool
+    call fails loudly if it is not; this guard stops a ticket going READY when the
+    bridge itself is down, which is the failure that otherwise looks like a hang."""
+    open_ = opener or urllib.request.urlopen
+    try:
+        req = urllib.request.Request(IBKR_MCP, method="HEAD", headers={"User-Agent": "trader-broker/guard"})
+        with open_(req, timeout=timeout):
+            pass
+    except urllib.error.HTTPError as e:
+        if e.code >= 500:
+            return False, "IBKR bridge %s answered %d" % (IBKR_MCP, e.code)
+        # 401/403/405 all mean the host is up and wants the OAuth session Claude holds
+    except (urllib.error.URLError, OSError) as e:
+        return False, "IBKR bridge unreachable: %s" % getattr(e, "reason", e)
+    url = cfg.get("ibkr_auth_url") or (IBKR_GATEWAY_AUTH if cfg.get("ibkr_gateway") else None)
+    if url:
+        try:
+            req = urllib.request.Request(url, method="POST", data=b"", headers={"User-Agent": "trader-broker/guard"})
+            with open_(req, timeout=timeout) as r:
+                st = json.loads(r.read().decode("utf-8"))
+        except (urllib.error.URLError, OSError, ValueError) as e:
+            return False, "IBKR gateway %s not answering: %s" % (url, getattr(e, "reason", e))
+        if not st.get("authenticated"):
+            return False, "IBKR gateway session is not authenticated: log in at the gateway first"
+    return True, "IBKR bridge reachable"
+
+
+def status_of(order, risk, state, today, cfg=None):
     """(ready, label, risk_result)"""
     fp = fingerprint(order)
     rv, why = risk_verdict(risk, fp, today)
@@ -337,6 +378,10 @@ def status_of(order, risk, state, today):
         if st == "approved":
             return False, "APPROVED by you at %s, waiting for the place_stock_order call" % rec.get("at"), rv
         return False, "DONE: %s at %s" % (st, rec.get("at")), rv
+    if str((cfg or {}).get("broker", "alpaca")).lower() == "ibkr":
+        ok, why = ibkr_guard(cfg)
+        if not ok:
+            return False, "NOT READY: " + why, rv
     return True, "READY: trader-risk PASS, waiting for your yes", rv
 
 
@@ -350,7 +395,7 @@ def kind_of(order, rv):
 # ---------------------------------------------------------------- rendering
 
 def render(order, idx, total, cfg, risk, state, today):
-    ready, label, rv = status_of(order, risk, state, today)
+    ready, label, rv = status_of(order, risk, state, today, cfg)
     broker = str(cfg.get("broker", "alpaca")).lower()
     paper = cfg.get("paper", True)
     acct = "PAPER account" if paper else "LIVE ACCOUNT, REAL MONEY"
@@ -380,7 +425,7 @@ def render(order, idx, total, cfg, risk, state, today):
 
 
 def ticket_json(order, idx, cfg, risk, state, today):
-    ready, label, rv = status_of(order, risk, state, today)
+    ready, label, rv = status_of(order, risk, state, today, cfg)
     loss, stop = max_loss(order)
     return {"index": idx, "ready": ready, "status": label, "plain": plain(order),
             "fingerprint": fingerprint(order), "paper": bool(cfg.get("paper", True)),
@@ -500,7 +545,7 @@ def cmd_show(a):
 def cmd_approve(a):
     orders, cfg, risk, state, today, now = _load(a)
     order = _pick(orders, a.index)
-    ready, label, rv = status_of(order, risk, state, today)
+    ready, label, rv = status_of(order, risk, state, today, cfg)
     if not ready:
         raise TicketError("order %d is not ready: %s" % (a.index, label))
     ok, why = parse_yes(a.reply, order, [o.get("symbol", "") for o in orders])

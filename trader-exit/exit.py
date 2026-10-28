@@ -537,7 +537,7 @@ def gather(a):
             raise PlanError("give both --or-high and --or-low, or neither")
         info = {"symbol": a.symbol.upper(), "entry": a.entry, "setup": a.setup or ("orb" if a.or_high is not None else "level"),
                 "date": a.date, "entry_time": a.time, "entry_bar": a.entry_bar, "interval": a.interval or "5m",
-                "or_high": a.or_high, "or_low": a.or_low, "or_minutes": a.or_minutes, "source": "flags"}
+                "or_high": a.or_high, "or_low": a.or_low, "or_minutes": a.or_minutes, "source": "flags", "jev": None}
     else:
         path = a.from_path or "trader/entry.json"
         doc = read_json(path, "entry (run /trader-entry first, or give --symbol and --entry)")
@@ -554,7 +554,7 @@ def gather(a):
                 "interval": a.interval or doc.get("interval") or "5m",
                 "or_high": a.or_high if a.or_high is not None else orr.get("high"),
                 "or_low": a.or_low if a.or_low is not None else orr.get("low"),
-                "or_minutes": orr.get("minutes") or a.or_minutes, "source": path}
+                "or_minutes": orr.get("minutes") or a.or_minutes, "source": path, "jev": doc.get("jev")}
         if not info["symbol"] or info["entry"] is None:
             raise PlanError("%s has no symbol or price" % path)
     if info["interval"] not in INTERVALS:
@@ -605,6 +605,8 @@ def build_plan(a, now_utc):
             "target": float(c["target"]), "target_r": float(c["target_r"]), "target_label": c["target_label"],
             "risk_per_share": float(c["risk"]), "reward_risk": float(c["reward_risk"]), "flat_by": flat_by,
             "stop_detail": c["stop_detail"], "created_at": now_utc.strftime("%Y-%m-%dT%H:%M:%SZ"), "note": NOTE}
+    if info.get("jev"):
+        plan["jev"] = info["jev"]      # P(setup works) from trader-entry, kept for the audit trail
     if atr is not None:
         plan["atr"] = round(atr, 4)
         plan["atr_bars"] = atr_n
