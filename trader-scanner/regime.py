@@ -218,6 +218,8 @@ def run(a, opener=None, now=None):
     if not a.dry_run:
         before = write_regime(a.config, res["market_regime"], now_iso)
         res["previous"] = before
+        if os.path.dirname(a.out):
+            os.makedirs(os.path.dirname(a.out), exist_ok=True)
         with open(a.out, "w", encoding="utf-8") as fh:
             json.dump(res, fh, indent=2)
             fh.write("\n")
