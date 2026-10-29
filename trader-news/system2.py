@@ -36,6 +36,7 @@ import json
 import os
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 
@@ -65,7 +66,10 @@ def user_agent(config="trader/config.json"):
 
 
 def get(url, timeout=20):
-    req = urllib.request.Request(url, headers={"User-Agent": user_agent(), "Accept": "*/*"})
+    # The SEC agent carries a name and email: only sec.gov gets it, everyone else sees the generic UA.
+    host = urllib.parse.urlsplit(url).hostname or ""
+    ua = user_agent() if host == "sec.gov" or host.endswith(".sec.gov") else UA
+    req = urllib.request.Request(url, headers={"User-Agent": ua, "Accept": "*/*"})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return r.read().decode("utf-8", "replace")
 

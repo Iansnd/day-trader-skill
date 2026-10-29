@@ -105,7 +105,7 @@ class Repo(unittest.TestCase):
         for s in SKILLS:
             folder = os.path.join(ROOT, s)
             for f in os.listdir(folder):
-                if not f.endswith(".py"):
+                if not f.endswith(".py") or f.startswith("._"):   # exFAT SSD: AppleDouble shadows
                     continue
                 with open(os.path.join(folder, f), encoding="utf-8") as fh:
                     src = fh.read()
