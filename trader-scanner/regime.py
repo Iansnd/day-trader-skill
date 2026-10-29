@@ -8,10 +8,11 @@ trader/config.json as "market_regime": "RISK_ON" or "RISK_OFF":
             moving averages, and the VIX closed below --vix-max (22).
   RISK_OFF  anything else, including missing data (fail closed).
 
-trader-entry reads the flag: on RISK_OFF it skips the Jev scoring call and
-logs "Execution halted: Macro conditions hostile to breakouts." The flag is
-a mechanical rule from closes, not a judgement call, so this script is the
-only writer; Claude does not hand-edit it.
+trader-entry reads the flag and tags every setup, Jev score and entry.json
+with it. It is evidence for later calibration, not a gate: a split test on the
+TSLA fixture (Jul-Oct 2026, 33 ORB triggers) showed no edge from blocking
+RISK_OFF days, so nothing is halted. The flag is a mechanical rule from
+closes, not a judgement call, so this script is the only writer.
 
     python3 regime.py                          # Yahoo daily bars (the repo's own data path)
     python3 regime.py --bars trader/macro_bars.json   # bars Claude fetched over the IBKR MCP
@@ -43,7 +44,7 @@ SYMBOLS = ("SPY", "QQQ", "VIX")
 YAHOO = {"SPY": "SPY", "QQQ": "QQQ", "VIX": "%5EVIX"}
 CHART = "https://query2.finance.yahoo.com/v8/finance/chart/%s?range=3mo&interval=1d"
 UA = "trader-scanner/regime (stdlib urllib)"
-HALT = "Execution halted: Macro conditions hostile to breakouts."
+NOTE = "RISK_OFF: setups are still scored and logged, tagged with the regime. Not a halt."
 
 
 class RegimeError(Exception):
@@ -312,7 +313,7 @@ def main(argv=None):
             )
         )
         if res["market_regime"] == "RISK_OFF":
-            print(HALT)
+            print(NOTE)
     return 0 if res["market_regime"] == "RISK_ON" else 1
 
 

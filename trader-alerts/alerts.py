@@ -599,6 +599,7 @@ def cmd_check(a):
     rings, state = evaluate(rules, quotes, status, state, now)
     if not a.no_write:
         _write(a.state, state)
+        close_jev_loop(rings, status["date"], a.config)
         if quotes:
             write_prices(a.prices_out, quotes, now, a.source)
     if a.json:
@@ -620,6 +621,18 @@ def cmd_check(a):
                   "the broker: check get_open_position and record any fill (ticket.py fill). To close a "
                   "position yourself: ticket.py flatten, then trader-risk and your yes.")
     return 0 if rings else 1
+
+
+def close_jev_loop(rings, today, config_path):
+    """A plan stop or target that rang is the outcome Jev was scored against:
+    write it back into trader/state/jev_scores.jsonl (see day-trader-skill/jev.py)."""
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    import jev
+    log = jev.settings(config_path).get("log")
+    for r in rings:
+        for word in ("stop", "target"):
+            if r["id"].endswith("-plan-" + word) and r.get("symbol"):
+                jev.set_outcome(log, r["symbol"], today, word)
 
 
 def cmd_add(a):
@@ -742,6 +755,7 @@ def main(argv=None):
     p.add_argument("--state", default="trader/state/alerts.json")
     p.add_argument("--prices-out", default="trader/prices.json")
     p.add_argument("--no-write", action="store_true")
+    p.add_argument("--config", default="trader/config.json")
     p = sub.add_parser("add", help="add a rule")
     p.add_argument("--rules", default="trader/alerts.json")
     p.add_argument("--state", default="trader/state/alerts.json")

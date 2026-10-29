@@ -880,6 +880,37 @@ def cmd_universe(a):
     return 0 if kept else 1
 
 
+JEV_RERANK = {
+    "quality": {"type": "score",
+                "instructions": "Rate this daily-close setup as a candidate for a long day trade tomorrow "
+                                "(reclaim of a moving average, RSI not stretched, liquid, price not already extended).",
+                "criteria": ["poor: stretched RSI, thin, or the setup is stale",
+                             "weak", "fair", "good",
+                             "strong: fresh reclaim, RSI in the 45-65 band, very liquid, room above"]},
+    "follow_through": {"type": "noul", "instructions": "Will this stock trade above today's close for most of "
+                                                       "tomorrow's first hour?"},
+}
+
+
+def jev_rerank(hits, config_path):
+    """Re-rank daily hits with Jev and keep the top N (jev.rerank_keep, 20). Off -> hits unchanged.
+    This order is what trader-news/system2 spends its X searches on, so the cut matters."""
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    import jev
+    cfg = jev.settings(config_path)
+    if not jev.enabled(cfg) or not hits:
+        return hits
+    got = jev.ask_many(cfg, hits, JEV_RERANK)
+    for h, g in zip(hits, got):
+        a = g.get("answers") or {}
+        h["jev"] = {"quality": a.get("quality"), "p_follow_through": a.get("follow_through"),
+                    "confidence": (g.get("confidence") or {}).get("quality")} if "answers" in g else {"error": g.get("error")}
+    scored = [h for h in hits if h["jev"].get("quality") is not None]
+    scored.sort(key=lambda h: (-h["jev"]["quality"], -(h["jev"]["p_follow_through"] or 0), h["symbol"]))
+    keep = max(1, int(cfg.get("rerank_keep", 20)))
+    return scored[:keep] or hits   # every call failed -> the dollar-volume order stands
+
+
 def cmd_daily(a):
     t0 = time.time()
     now = parse_now(a.now)
@@ -893,6 +924,7 @@ def cmd_daily(a):
                  % ("{:,}".format(len(symbols)), (len(symbols) + SPARK_MAX - 1) // SPARK_MAX))
         data, failed = fetch_spark(symbols, "3mo", "1d", a.pause, a)
     hits, counts, last_date = scan_daily(data, symbols, now, a.min_price, a.min_volume)
+    hits = jev_rerank(hits, a.config)
     nfailed = len(symbols) - counts["fetched"]
     as_of = ("%s close" % last_date.isoformat()) if last_date else None
     doc = {"created_by": "trader-scanner", "created_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"), "mode": "daily",
@@ -1054,6 +1086,7 @@ def main(argv=None):
         p.add_argument("--show", type=int, default=50, help="hits to print (all are written)")
         p.add_argument("--quiet", action="store_true")
         p.add_argument("--json", action="store_true")
+        p.add_argument("--config", default="trader/config.json")
 
     p = sub.add_parser("daily", help="pre-market setups from daily closes")
     common(p, 5.0, 1000000)
@@ -1064,7 +1097,6 @@ def main(argv=None):
                    help="v8 charts to fetch in stage 2, most traded first (%d; 0 = all)" % MAX_CONFIRM)
     p.add_argument("--at", help="cut the clock at this New York time, HH:MM")
     p.add_argument("--until", help="no new entries after HH:MM (default: config no_entries_after, 15:30)")
-    p.add_argument("--config", default="trader/config.json")
     a = ap.parse_args(argv)
     if not a.cmd:
         ap.print_help()

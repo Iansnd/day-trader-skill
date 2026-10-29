@@ -554,42 +554,41 @@ def evaluate(chart, now_utc, setup="orb", or_minutes=15, interval="5m", level=No
 
 # ---------------------------------------------------------------- jev (logged scorer)
 #
-# TypeSafe Jev, a System 1 decision model, answers one noul question per setup:
-# P(this long setup reaches its target before its stop). It is a SCORER, not a
-# gate: the bar-by-bar logic above still decides "triggered". The probability
-# rides along in trader/entry.json (exit.py copies it into trader/plan.json) and
-# every score is appended to trader/state/jev_scores.jsonl so it can be
-# calibrated against outcomes before anyone lets it block an entry.
+# TypeSafe Jev, a System 1 decision model, scores every evaluate() result with
+# four noul questions in ONE call (the server answers them in parallel): the
+# compound "works" plus three factors it decomposes into. It is a SCORER, not a
+# gate: the bar-by-bar logic above still decides "triggered". The score rides
+# along in trader/entry.json (exit.py copies it into trader/plan.json) and every
+# score is appended to trader/state/jev_scores.jsonl. alerts.py and ticket.py
+# write the outcome ("target", "stop", "flat") back into that row, so the file
+# calibrates p_works against what happened before anyone lets it block an entry.
 #
-# Off unless trader/config.json has {"jev": {"enabled": true}} AND JEV_API_KEY
-# is set. Direct HTTP to the official endpoint; no gateway, no SDK.
-# Wire format (docs.typesafe.ai/primitives/noul): POST {state, model, questions}
-# -> {"model": "jev-1.13.0", "answers": {"works": {"type": "noul", "noul": 0.93}}, "usage": {...}}
+# Client, wire format and the on/off switch live in day-trader-skill/jev.py.
 
-JEV_URL = "https://api.typesafe.ai/v1/systemone"
-JEV_DEFAULTS = {"enabled": False, "model": "jev-latest", "timeout": 3, "workers": 16,
-                "log": "trader/state/jev_scores.jsonl"}
-JEV_QUESTION = ("This is a long-only intraday setup on a US stock. Will a buy at the trigger price "
-                "reach the plan's target before it hits the stop today?")
-JEV_CRITERIA = {"true": "clean close above the level, volume at or above the range bars, early in the "
-                        "session, range not already extended",
-                "false": "late trigger, weak volume, price far above the level already, or the setup expired"}
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import jev  # noqa: E402
 
+JEV_QUESTIONS = {
+    "works": {"type": "noul",
+              "instructions": "This is a long-only intraday setup on a US stock. Will a buy at the trigger "
+                              "price reach the plan's target before it hits the stop today?",
+              "criteria": {"true": "clean close above the level, volume at or above the range bars, early in "
+                                   "the session, range not already extended",
+                           "false": "late trigger, weak volume, price far above the level already, or the "
+                                    "setup expired"}},
+    "volume_ok": {"type": "noul", "instructions": "Is the trigger bar's volume convincing, at or above the "
+                                                  "opening-range bars' average?"},
+    "timing_ok": {"type": "noul", "instructions": "Is the trigger early enough in the session (before 11:00 "
+                                                  "New York) for the move to have room?"},
+    "not_extended": {"type": "noul", "instructions": "Is the last close still near the level, not already "
+                                                     "extended more than a normal pullback away from it?"},
+}
 
-HALT = "Execution halted: Macro conditions hostile to breakouts."
+REGIME_NOTE = "Macro regime RISK_OFF (SPY/QQQ under their averages or VIX high): scored and logged, not blocked."
 
 
 def jev_settings(config_path):
-    cfg = dict(JEV_DEFAULTS)
-    try:
-        with open(config_path, encoding="utf-8") as fh:
-            doc = json.load(fh)
-        cfg.update(doc.get("jev") or {})
-        cfg["market_regime"] = doc.get("market_regime")  # written by trader-scanner/regime.py
-    except (OSError, ValueError):
-        pass
-    cfg["key"] = os.environ.get("JEV_API_KEY")
-    return cfg
+    return jev.settings(config_path)
 
 
 def jev_state(res):
@@ -599,63 +598,37 @@ def jev_state(res):
     return json.dumps({k: res.get(k) for k in keep if res.get(k) is not None}, separators=(",", ":"))
 
 
-def jev_ask(cfg, state, opener=None):
-    body = json.dumps({"state": state, "model": cfg["model"],
-                       "questions": {"works": {"type": "noul", "instructions": JEV_QUESTION,
-                                               "criteria": JEV_CRITERIA}}}).encode("utf-8")
-    req = urllib.request.Request(JEV_URL, data=body, method="POST",
-                                 headers={"Authorization": "Bearer " + cfg["key"],
-                                          "Content-Type": "application/json", "User-Agent": "trader-entry/jev"})
-    t0 = time.time()
-    with (opener or urllib.request.urlopen)(req, timeout=cfg["timeout"]) as r:
-        doc = json.loads(r.read().decode("utf-8"))
-    p = float(doc["answers"]["works"]["noul"])        # the native noul float, 0..1
-    if not 0.0 <= p <= 1.0:
-        raise ValueError("noul out of range: %r" % p)
-    return {"p_works": round(p, 4), "model": doc.get("model", cfg["model"]),
-            "latency_ms": int((time.time() - t0) * 1000)}
-
-
-def jev_log(path, res, out):
-    if not path:
-        return
-    d = os.path.dirname(path)
-    if d:
-        os.makedirs(d, exist_ok=True)
-    t = res.get("trigger") or {}
-    row = {"symbol": res.get("symbol"), "date": res.get("date"), "status": res.get("status"),
-           "setup": res.get("setup"), "trigger_time": t.get("time"), "trigger_price": t.get("price"),
-           "outcome": None}       # filled later by trader-alerts/broker: "target", "stop" or "flat"
-    row.update(out)
-    with open(path, "a", encoding="utf-8") as fh:
-        fh.write(json.dumps(row) + "\n")
-
-
 def jev_score(res, cfg, opener=None):
-    """P(setup works) for one evaluate() result; None when off. A failure is
-    logged as {"p_works": null, "error": ...} so the audit shows the gap."""
-    if not cfg.get("enabled") or not cfg.get("key"):
+    """Score one evaluate() result; None when off. A failure is logged as
+    {"p_works": null, "error": ...} so the audit shows the gap."""
+    if not jev.enabled(cfg):
         return None
     try:
-        out = jev_ask(cfg, jev_state(res), opener)
-    except (urllib.error.URLError, OSError, KeyError, ValueError, TypeError) as e:
+        got = jev.ask(cfg, jev_state(res), JEV_QUESTIONS, opener)
+        a = got["answers"]
+        out = {"p_works": a["works"], "factors": {k: a[k] for k in a if k != "works"},
+               "model": got["model"], "latency_ms": got["latency_ms"]}
+    except jev.ERRORS as e:
         out = {"p_works": None, "error": str(e)[:200]}
     out["asked_at"] = iso(utc_now())
-    jev_log(cfg.get("log"), res, out)
+    out["market_regime"] = cfg.get("market_regime")
+    t = res.get("trigger") or {}
+    jev.log(cfg.get("log"), dict({"symbol": res.get("symbol"), "date": res.get("date"), "status": res.get("status"),
+                                  "setup": res.get("setup"), "trigger_time": t.get("time"),
+                                  "trigger_price": t.get("price"), "outcome": None}, **out))
     return out
 
 
 def jev_attach(results, config_path, opener=None):
     """Score many evaluate() results concurrently and set res["jev"]. This is
     where Jev's 70-220 ms matters: the whole watchlist is one round trip."""
-    cfg = jev_settings(config_path)
-    if not cfg.get("enabled") or not cfg.get("key"):
+    cfg = jev.settings(config_path)
+    if not jev.enabled(cfg):
         return results
-    if cfg.get("market_regime") == "RISK_OFF":  # the macro gate: no Jev call at all
-        print(HALT, file=sys.stderr)
-        for r in results:
-            r["jev"] = {"p_works": None, "halted": HALT}
-        return results
+    for r in results:  # the regime rides along as evidence; it is not a gate (see tests/test_regime.py)
+        r["market_regime"] = cfg.get("market_regime")
+    if cfg.get("market_regime") == "RISK_OFF":
+        print(REGIME_NOTE, file=sys.stderr)
     from concurrent.futures import ThreadPoolExecutor
     with ThreadPoolExecutor(max_workers=max(1, int(cfg.get("workers", 16)))) as ex:
         for r, out in zip(results, ex.map(lambda r: jev_score(r, cfg, opener), results)):
@@ -679,7 +652,7 @@ def entry_doc(res, now_utc):
             "interval": res["interval"],
             "opening_range": {"high": orr["high"], "low": orr["low"], "minutes": orr["minutes"]} if orr else None,
             "source": "yahoo", "checked_at": iso(now_utc), "reason": res.get("reason"),
-            "jev": res.get("jev")}
+            "jev": res.get("jev"), "market_regime": res.get("market_regime")}
 
 
 def write_json(path, doc):

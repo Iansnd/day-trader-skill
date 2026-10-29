@@ -693,6 +693,70 @@ def cmd_show(a):
     return 0
 
 
+JEV_HOLD = {
+    "hold": {"type": "score",
+             "instructions": "You hold this long day trade. Given the plan and the bars since the entry, "
+                             "should the trader hold it or exit now?",
+             "criteria": ["exit now: thesis broken, stop about to hit, or the move has reversed",
+                          "lean exit", "neutral", "lean hold",
+                          "hold: trend intact, target still likely before the stop"]},
+    "reach_target": {"type": "noul", "instructions": "From the last bar, will the price reach the plan's "
+                                                     "target before it hits the stop, before flat_by today?"},
+}
+
+
+def cmd_hold(a):
+    """Per-bar hold/exit score for the open plan: run it after each bar closes (alerts.py check, or a cron).
+    A score, not an order: a low score is a reason to look, ticket.py flatten is the action."""
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    import jev
+    plan = read_json(a.plan, "plan")
+    for k in ("symbol", "date", "entry", "stop", "target"):
+        if plan.get(k) is None:
+            raise PlanError("%s is missing %r: make a new plan with exit.py plan --write" % (a.plan, k))
+    cfg = jev.settings(a.config)
+    if not jev.enabled(cfg):
+        raise PlanError("Jev is off: set {\"jev\": {\"enabled\": true}} in %s and JEV_API_KEY" % a.config)
+    now = parse_now(a.now)
+    day = datetime.date.fromisoformat(plan["date"])
+    interval = plan.get("interval") or "5m"
+    bars = session_bars(load_chart(plan["symbol"], interval, day, a.offline), day, interval, now_utc=now)
+    if not bars:
+        raise PlanError("no closed %s bars for %s on %s yet" % (interval, plan["symbol"], plan["date"]))
+    et = parse_clock(plan["entry_time"], "the plan's entry time") if plan.get("entry_time") else None
+    since = [b for b in bars if et is None or to_eastern(utc_of(b["t"])).time() >= et]
+    tail = (since or bars)[-a.bars:]
+    last = tail[-1]
+    state = {"plan": {k: plan.get(k) for k in ("symbol", "setup", "entry", "entry_time", "stop", "target", "flat_by")},
+             "now_new_york": to_eastern(now).strftime("%H:%M"), "last": last["c"],
+             "unrealized_r": round((last["c"] - plan["entry"]) / max(plan["entry"] - plan["stop"], 1e-9), 2),
+             "bars_since_entry": [{"t": to_eastern(utc_of(b["t"])).strftime("%H:%M"), "h": b["h"], "l": b["l"], "c": b["c"]}
+                                  for b in tail]}
+    try:
+        got = jev.ask(cfg, state, JEV_HOLD)
+        out = {"hold": got["answers"]["hold"], "confidence": got["confidence"].get("hold"),
+               "p_reach_target": got["answers"]["reach_target"], "model": got["model"], "latency_ms": got["latency_ms"]}
+    except jev.ERRORS as e:
+        out = {"hold": None, "error": str(e)[:200]}
+    out.update({"asked_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"), "last": last["c"], "unrealized_r": state["unrealized_r"]})
+    jev.log(cfg.get("log"), dict({"symbol": plan["symbol"], "date": plan["date"], "status": "hold-check",
+                                  "setup": plan.get("setup"), "trigger_time": plan.get("entry_time"),
+                                  "trigger_price": plan["entry"], "outcome": None}, **out))
+    if a.json:
+        print(json.dumps(out, indent=2))
+    elif out["hold"] is None:
+        print("%s: Jev did not answer (%s)." % (plan["symbol"], out["error"]))
+    else:
+        words = ["EXIT NOW", "LEAN EXIT", "NEUTRAL", "LEAN HOLD", "HOLD"]
+        print("%s at $%.2f (%+.2fR), %s bar %s: %s (score %.1f of 4, confidence %d%%), %d%% to reach the target "
+              "$%.2f before the stop $%.2f." % (plan["symbol"], last["c"], state["unrealized_r"], interval,
+                                                 state["bars_since_entry"][-1]["t"], words[min(4, int(round(out["hold"])))],
+                                                 out["hold"], round(100 * (out["confidence"] or 0)),
+                                                 round(100 * (out["p_reach_target"] or 0)), plan["target"], plan["stop"]))
+        print("A score, not an order. To close: ticket.py flatten --symbol %s, then trader-risk and your yes." % plan["symbol"])
+    return 0 if out["hold"] is not None else 1
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Exit Planner (trader-exit): the stop and target before the entry.")
     sub = ap.add_subparsers(dest="cmd")
@@ -722,12 +786,19 @@ def main(argv=None):
     p.add_argument("--plan", default="trader/plan.json")
     p.add_argument("--now")
     p.add_argument("--json", action="store_true")
+    p = sub.add_parser("hold", help="Jev hold/exit score for the open plan, per bar")
+    p.add_argument("--plan", default="trader/plan.json")
+    p.add_argument("--config", default="trader/config.json")
+    p.add_argument("--bars", type=int, default=12, help="bars since the entry to show Jev (default 12)")
+    p.add_argument("--offline", metavar="PATH", help="saved Yahoo chart JSON instead of the network")
+    p.add_argument("--now", help='pretend it is this New York time, e.g. "2026-10-19 10:15"')
+    p.add_argument("--json", action="store_true")
     a = ap.parse_args(argv)
     if not a.cmd:
         ap.print_help()
         return 1
     try:
-        return {"plan": cmd_plan, "show": cmd_show}[a.cmd](a)
+        return {"plan": cmd_plan, "show": cmd_show, "hold": cmd_hold}[a.cmd](a)
     except PlanError as e:
         print("exit.py: %s" % e, file=sys.stderr)
         return 1

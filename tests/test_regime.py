@@ -90,21 +90,38 @@ class Run(unittest.TestCase):
 
 
 class EntryGate(unittest.TestCase):
-    def test_risk_off_skips_jev_call(self):
+    def test_risk_off_scores_and_tags_not_halts(self):
         d = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, d)
         cfg = os.path.join(d, "config.json")
         with open(cfg, "w") as fh:
-            json.dump({"jev": {"enabled": True}, "market_regime": "RISK_OFF"}, fh)
+            json.dump({"jev": {"enabled": True, "log": os.path.join(d, "jev.jsonl")},
+                       "market_regime": "RISK_OFF"}, fh)
         os.environ["JEV_API_KEY"] = "x"
         self.addCleanup(os.environ.pop, "JEV_API_KEY", None)
-        res = [{"symbol": "AAPL"}]
+
+        class Resp(io.BytesIO):
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+        body = json.dumps({"model": "jev-test", "answers": {"works": {"type": "noul", "noul": 0.61}}}).encode()
+        calls = []
+        def opener(req, timeout=None):
+            calls.append(req)
+            return Resp(body)
+        res = [{"symbol": "AAPL", "trigger": {"time": "10:15", "price": 1.0}}]
         err = io.StringIO()
         with redirect_stderr(err):
-            entry.jev_attach(res, cfg, opener=lambda *x, **k: self.fail("Jev called"))
-        self.assertIn(entry.HALT, err.getvalue())
-        self.assertEqual(res[0]["jev"]["halted"], entry.HALT)
-
+            entry.jev_attach(res, cfg, opener=opener)
+        self.assertEqual(len(calls), 1, "Jev must be called on RISK_OFF days")
+        self.assertIn(entry.REGIME_NOTE, err.getvalue())
+        self.assertEqual(res[0]["market_regime"], "RISK_OFF")
+        self.assertEqual(res[0]["jev"]["p_works"], 0.61)
+        self.assertEqual(res[0]["jev"]["market_regime"], "RISK_OFF")
+        with open(os.path.join(d, "jev.jsonl")) as fh:
+            row = json.loads(fh.readline())
+        self.assertEqual(row["market_regime"], "RISK_OFF")
+        self.assertEqual(row["p_works"], 0.61)
+        self.assertNotIn("halted", res[0]["jev"])
 
 if __name__ == "__main__":
     unittest.main()

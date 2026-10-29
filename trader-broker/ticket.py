@@ -385,6 +385,34 @@ def status_of(order, risk, state, today, cfg=None):
     return True, "READY: trader-risk PASS, waiting for your yes", rv
 
 
+def _jev():
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    import jev
+    return jev
+
+
+def jev_advice(order, plan, cfg_path):
+    """Confidence gate on the plan's Jev score for a buy of the plan's symbol.
+    act (p_works >= act_above), escalate (< escalate_below) or neutral. None when
+    there is no score. A gate on the wording, never on the yes: the user still decides."""
+    plan = plan or {}
+    j = plan.get("jev") or {}
+    p = j.get("p_works")
+    if p is None or str(order.get("side", "")).lower() != "buy" \
+            or str(plan.get("symbol", "")).upper() != str(order.get("symbol", "")).upper():
+        return None
+    jc = _jev().settings(cfg_path)
+    advice = "act" if p >= float(jc["act_above"]) else "escalate" if p < float(jc["escalate_below"]) else "neutral"
+    line = {"act": "Jev: %d%% that this setup reaches its target first. Act on it if the ticket reads right.",
+            "escalate": "Jev: only %d%% that this setup reaches its target first. ESCALATE: re-read the chart "
+                        "and the plan before you say yes, or skip it.",
+            "neutral": "Jev: %d%% that this setup reaches its target first, neither strong nor weak."}[advice] % round(100 * p)
+    weak = [k for k, v in (j.get("factors") or {}).items() if isinstance(v, (int, float)) and v < 0.5]
+    if weak:
+        line += " Weak: %s." % ", ".join(weak)
+    return {"p_works": p, "advice": advice, "line": line}
+
+
 def kind_of(order, rv):
     """entry or exit, as trader-risk saw it (older checks: a buy is an entry)."""
     if rv and rv.get("kind"):
@@ -394,8 +422,9 @@ def kind_of(order, rv):
 
 # ---------------------------------------------------------------- rendering
 
-def render(order, idx, total, cfg, risk, state, today):
+def render(order, idx, total, cfg, risk, state, today, plan=None, cfg_path="trader/config.json"):
     ready, label, rv = status_of(order, risk, state, today, cfg)
+    adv = jev_advice(order, plan, cfg_path)
     broker = str(cfg.get("broker", "alpaca")).lower()
     paper = cfg.get("paper", True)
     acct = "PAPER account" if paper else "LIVE ACCOUNT, REAL MONEY"
@@ -407,6 +436,8 @@ def render(order, idx, total, cfg, risk, state, today):
     lines.append("  " + label)
     for w in (rv or {}).get("warnings", []):
         lines.append("  note: " + w)
+    if adv:
+        lines.append("  " + adv["line"])
     if broker == "ibkr":
         lines.append("  Claude drafts this with the Interactive Brokers connector. IBKR sends it to your")
         lines.append("  IBKR account, and it only goes to the market after you approve it there.")
@@ -424,10 +455,10 @@ def render(order, idx, total, cfg, risk, state, today):
     return "\n".join(lines), ready
 
 
-def ticket_json(order, idx, cfg, risk, state, today):
+def ticket_json(order, idx, cfg, risk, state, today, plan=None, cfg_path="trader/config.json"):
     ready, label, rv = status_of(order, risk, state, today, cfg)
     loss, stop = max_loss(order)
-    return {"index": idx, "ready": ready, "status": label, "plain": plain(order),
+    return {"index": idx, "ready": ready, "status": label, "plain": plain(order), "jev": jev_advice(order, plan, cfg_path),
             "fingerprint": fingerprint(order), "paper": bool(cfg.get("paper", True)),
             "broker": cfg.get("broker", "alpaca"), "tool": "place_stock_order",
             "tool_input": tool_input(order), "why": order.get("why", ""),
@@ -527,13 +558,14 @@ def _pick(orders, index):
 def cmd_show(a):
     orders, cfg, risk, state, today, now = _load(a)
     picks = [(a.index, _pick(orders, a.index))] if a.index else list(enumerate(orders, 1))
+    plan = read_json(a.plan, "plan", required=False) or {}
     if a.json:
-        out = [ticket_json(o, i, cfg, risk, state, today) for i, o in picks]
+        out = [ticket_json(o, i, cfg, risk, state, today, plan, a.config) for i, o in picks]
         print(json.dumps(out[0] if a.index else out, indent=2))
         return 0 if any(t["ready"] for t in out) else 1
     blocks, any_ready = [], False
     for i, o in picks:
-        text, ready = render(o, i, len(orders), cfg, risk, state, today)
+        text, ready = render(o, i, len(orders), cfg, risk, state, today, plan, a.config)
         blocks.append(text)
         any_ready = any_ready or ready
     print("\n\n".join(blocks))
@@ -658,6 +690,7 @@ def cmd_flatten(a):
            "note": "Flatten ticket. Nothing is placed until trader-risk passes it and you say yes in the chat.",
            "source": "ticket.py flatten %s on %s" % (sym, today), "orders": [order]}
     write_json(a.orders, doc)
+    _jev().set_outcome(_jev().settings(a.config).get("log"), sym, today, "flat")   # closes the Jev loop
     print("Flatten %s: %s (flat by %s New York)." % (sym, plain(order), flat_by))
     print("Wrote it to %s%s." % (a.orders, (" (it replaced %d earlier proposal%s)"
                                              % (replaced, "" if replaced == 1 else "s")) if replaced else ""))
@@ -704,6 +737,7 @@ def main(argv=None):
         p.add_argument("--config", default="trader/config.json")
         p.add_argument("--risk", default="trader/state/risk.json")
         p.add_argument("--state", default="trader/state/broker.json")
+        p.add_argument("--plan", default="trader/plan.json")
         clock(p)
 
     p = sub.add_parser("show", help="render the tickets")
