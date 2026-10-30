@@ -53,7 +53,93 @@ def positions(ib):
 
 
 def stock(symbol):
-    return _ib_async().Stock(symbol, "SMART", "USD")
+    if _has_ib():
+        return _ib_async().Stock(symbol, "SMART", "USD")
+    import types
+    return types.SimpleNamespace(symbol=symbol, secType="STK")   # tests without the package
+
+
+def _has_ib():
+    try:
+        _ib_async()
+        return True
+    except ImportError:
+        return False
+
+
+def _order(kind, action, qty, price=None, **kw):
+    """kind: MKT | LMT | STP. Same fields whether ib_async builds it or a stand-in does."""
+    base = dict(action=action, totalQuantity=float(qty), orderType=kind, tif="DAY", ocaGroup="", ocaType=0,
+                lmtPrice=0.0, auxPrice=0.0, orderId=0)
+    if _has_ib():
+        ib = _ib_async()
+        o = {"MKT": lambda: ib.MarketOrder(action, float(qty)),
+             "LMT": lambda: ib.LimitOrder(action, float(qty), float(price)),
+             "STP": lambda: ib.StopOrder(action, float(qty), float(price))}[kind]()
+    else:
+        import types
+        o = types.SimpleNamespace(**base)
+        if kind == "LMT":
+            o.lmtPrice = float(price)
+        elif kind == "STP":
+            o.auxPrice = float(price)
+    o.tif = "DAY"
+    for k, v in kw.items():
+        setattr(o, k, v)
+    return o
+
+
+def _wait_fill(ib, trade, wait_s):
+    for _ in range(int(wait_s)):
+        if trade.orderStatus.status == "Filled":
+            return True
+        ib.sleep(1)
+    return trade.orderStatus.status == "Filled"
+
+
+def place_entry(ib, order, wait_s=30):
+    """The entry from trader/orders.json as a DAY market (or limit) order; waits for the fill.
+    Cancels and raises when nothing filled inside wait_s: a market order that sits is a broker problem."""
+    sym = order["symbol"].upper()
+    action = order["side"].upper()
+    if order.get("type") == "limit":
+        o = _order("LMT", action, order["qty"], order["limit_price"])
+    else:
+        o = _order("MKT", action, order["qty"])
+    trade = ib.placeOrder(stock(sym), o)
+    if not _wait_fill(ib, trade, wait_s) and float(trade.orderStatus.filled or 0) <= 0:
+        ib.cancelOrder(trade.order)
+        raise TwsError("entry %s %s not filled in %ss (status %s); cancelled" % (action, sym, wait_s, trade.orderStatus.status))
+    st = trade.orderStatus
+    return {"order_id": trade.order.orderId, "status": st.status, "filled_qty": float(st.filled),
+            "fill_price": float(st.avgFillPrice)}
+
+
+def bracket_prices(fill_price, stop, target_r):
+    """Stop stays the plan's; the target is target_r times the real risk above the real fill."""
+    return float(stop), round(fill_price + float(target_r) * (fill_price - float(stop)), 2)
+
+
+def attach_bracket(ib, order, filled_qty, fill_price, date=None, entry_id=0):
+    """Two DAY sells for what actually filled, one OCA group so the broker cancels the other on a fill."""
+    import datetime
+    sym = order["symbol"].upper()
+    plan = order.get("plan") or {}
+    stop, target = bracket_prices(fill_price, order.get("stop_loss_stop_price") or plan["stop"], plan.get("target_r", 2.0))
+    group = "%s-%s-%s" % (sym, date or datetime.date.today().isoformat(), entry_id)
+    stop_t = ib.placeOrder(stock(sym), _order("STP", "SELL", filled_qty, stop, ocaGroup=group, ocaType=1))
+    target_t = ib.placeOrder(stock(sym), _order("LMT", "SELL", filled_qty, target, ocaGroup=group, ocaType=1))
+    return {"oca_group": group, "stop_id": stop_t.order.orderId, "target_id": target_t.order.orderId,
+            "stop": stop, "target": target, "qty": float(filled_qty), "symbol": sym}
+
+
+def cancel_group(ib, oca_group):
+    n = 0
+    for t in list(ib.openTrades()):
+        if t.order.ocaGroup == oca_group:
+            ib.cancelOrder(t.order)
+            n += 1
+    return n
 
 
 def cmd_ping(a):
