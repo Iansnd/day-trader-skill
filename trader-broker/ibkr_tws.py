@@ -6,7 +6,7 @@ attach an OCA stop + target priced from the real fill, hold to the exit.
 
 Every function takes the `ib` object so tests pass tests/fake_ib.py. ib_async is
 imported lazily, inside connect(), so the rest of the repo stays stdlib-only.
-Port 7496 (live) is refused whatever the config says.
+Live ports 7496 (TWS) and 4001 (Gateway) are refused whatever the config says.
 """
 import argparse
 import json
@@ -14,7 +14,8 @@ import os
 import sys
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-PAPER_PORT, LIVE_PORT = 7497, 7496
+PAPER_PORT, LIVE_PORT = 7497, 7496          # TWS paper/live
+GATEWAY_LIVE_PORT = 4001                       # IB Gateway live; paper gateway is 4002
 DEFAULT_TWS = {"host": "127.0.0.1", "port": PAPER_PORT, "client_id": 7}
 
 
@@ -37,8 +38,8 @@ def connect(cfg, factory=None):
     tws = dict(DEFAULT_TWS, **(cfg.get("tws") or {}))
     if cfg.get("paper") is not True:
         raise TwsError("config paper is not true; the TWS path is paper only")
-    if int(tws["port"]) == LIVE_PORT:
-        raise TwsError("live port %d refused" % LIVE_PORT)
+    if int(tws["port"]) in (LIVE_PORT, GATEWAY_LIVE_PORT):
+        raise TwsError("live port %s refused" % tws["port"])
     ib = (factory or _ib_async().IB)()
     try:
         ib.connect(tws["host"], int(tws["port"]), clientId=int(tws["client_id"]), timeout=10)

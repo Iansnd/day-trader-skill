@@ -10,6 +10,8 @@ class Connect(unittest.TestCase):
     def test_connect_refuses_live_port(self):
         with self.assertRaises(tws.TwsError):
             tws.connect({"paper": True, "tws": {"port": 7496}}, factory=FakeIB)
+        with self.assertRaises(tws.TwsError):
+            tws.connect({"paper": True, "tws": {"port": 4001}}, factory=FakeIB)
 
     def test_connect_refuses_non_paper(self):
         with self.assertRaises(tws.TwsError):
