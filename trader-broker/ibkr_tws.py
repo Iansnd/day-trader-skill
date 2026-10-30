@@ -142,6 +142,34 @@ def cancel_group(ib, oca_group):
     return n
 
 
+def _hhmm(t):
+    return t.strftime("%H:%M") if hasattr(t, "strftime") else str(t)
+
+
+def hold(ib, bracket, flat_by, now_fn, every=5, on_fill=None):
+    """Poll until the stop or the target fills, or flat_by (HH:MM ET) arrives: then cancel the
+    group and sell at market. on_fill("sell", qty, price) is called exactly once for the exit."""
+    ids = {bracket["stop_id"]: "stopped", bracket["target_id"]: "target"}
+    while True:
+        for t in ib.trades():
+            if t.order.orderId in ids and t.orderStatus.status == "Filled":
+                qty, price = float(t.orderStatus.filled), float(t.orderStatus.avgFillPrice)
+                if on_fill:
+                    on_fill("sell", qty, price)
+                return {"outcome": ids[t.order.orderId], "qty": qty, "price": price}
+        if _hhmm(now_fn()) >= flat_by:
+            cancel_group(ib, bracket["oca_group"])
+            trade = ib.placeOrder(stock(bracket["symbol"]), _order("MKT", "SELL", bracket["qty"]))
+            if not _wait_fill(ib, trade, 30):
+                raise TwsError("flat-by market sell of %s %s not filled in 30s (status %s)"
+                               % (bracket["qty"], bracket["symbol"], trade.orderStatus.status))
+            qty, price = float(trade.orderStatus.filled), float(trade.orderStatus.avgFillPrice)
+            if on_fill:
+                on_fill("sell", qty, price)
+            return {"outcome": "flattened", "qty": qty, "price": price}
+        ib.sleep(every)
+
+
 def cmd_ping(a):
     with open(a.config, encoding="utf-8") as fh:
         cfg = json.load(fh)

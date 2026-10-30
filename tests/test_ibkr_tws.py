@@ -58,5 +58,32 @@ class Bracket(unittest.TestCase):
         self.assertEqual(ib.openTrades(), [])
 
 
+class Hold(unittest.TestCase):
+    def test_hold_books_stop_fill_once(self):
+        ib = FakeIB(); b = tws.attach_bracket(ib, ICE, 16, 168.79)
+        ib.script.append(("fill_sell", b["stop_id"], 16, 166.40))
+        fills = []
+        r = tws.hold(ib, b, "15:55", now_fn=lambda: "10:40", on_fill=lambda *a: fills.append(a))
+        self.assertEqual(r["outcome"], "stopped")
+        self.assertEqual(fills, [("sell", 16.0, 166.40)])
+        self.assertEqual(ib.openTrades(), [])   # the broker cancelled the target (OCA)
+
+    def test_hold_target_fill(self):
+        ib = FakeIB(); b = tws.attach_bracket(ib, ICE, 16, 168.79)
+        ib.script.append(("fill_sell", b["target_id"], 16, 173.35))
+        r = tws.hold(ib, b, "15:55", now_fn=lambda: "10:40", on_fill=lambda *a: None)
+        self.assertEqual((r["outcome"], r["price"]), ("target", 173.35))
+
+    def test_hold_flattens_at_flat_by(self):
+        ib = FakeIB(); b = tws.attach_bracket(ib, ICE, 16, 168.79)
+        ib.script.append(("fill_sell", "next_market", 16, 169.10))
+        fills = []
+        r = tws.hold(ib, b, "15:55", now_fn=lambda: "15:55", on_fill=lambda *a: fills.append(a))
+        self.assertEqual((r["outcome"], r["qty"], r["price"]), ("flattened", 16.0, 169.10))
+        self.assertEqual(ib.openTrades(), [])
+        self.assertEqual(sorted(ib.cancelled), [b["stop_id"], b["target_id"]])
+        self.assertEqual(fills, [("sell", 16.0, 169.10)])
+
+
 if __name__ == "__main__":
     unittest.main()

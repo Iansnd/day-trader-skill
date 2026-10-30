@@ -6,8 +6,11 @@ and builds a decision card when one triggers. Standard library only.
     python3 day-trader-skill/trader-autopilot/autopilot.py morning   # regime, daily scan, news -> picks
     python3 day-trader-skill/trader-autopilot/autopilot.py watch     # poll the picks until a trigger
 
-It never places an order. The chain stops at check.py + ticket.py show, and the
-card it writes (trader/decision.json) is what you look at before saying yes.
+By default it never places an order: the chain stops at check.py + ticket.py show,
+and the card it writes (trader/decision.json) is what you look at before saying yes.
+With "auto_place": true and "paper": true in trader/config.json it goes on to place
+the entry at IBKR through the TWS API (ibkr_tws.py), attaches the OCA stop + target
+from the real fill, and holds until one fills or flat_by, then sells at market.
 Launchd cannot enter the external volume, so the script does the chdir itself.
 """
 
@@ -232,8 +235,83 @@ def decide(root, trigger, runner=subprocess.run, now=None, notifier=notify):
     return card
 
 
+def _ticket():
+    return _tool("trader-broker", "ticket")
+
+
+def _tws():
+    return _tool("trader-broker", "ibkr_tws")
+
+
+def trade(root, card, cfg, connect=None, now_fn=now_et, notifier=notify):
+    """A ready card -> entry + OCA bracket at IBKR -> hold to the exit -> fills booked. Paper only, opt in."""
+    if card.get("status") != "ready" or not (cfg.get("auto_place") and cfg.get("paper") is True):
+        return card
+    os.chdir(root)
+    tws, ticket = _tws(), _ticket()
+    sym = card["symbol"]
+    order = ((load_json("trader/orders.json", {}) or {}).get("orders") or [{}])[0]
+    t = now_fn()
+    today = t.date().isoformat() if hasattr(t, "date") else datetime.date.today().isoformat()
+    state_path, pf_path = "trader/state/broker.json", "trader/portfolio.json"
+
+    def fail(msg, unprotected=False):
+        card.update({"status": "broker_error", "error": str(msg), "unprotected": unprotected})
+        write_json("trader/decision.json", card)
+        notifier("Autopilot: %s broker error" % sym,
+                 ("%s is open with NO stop: %s" % (sym, msg)) if unprotected else str(msg))
+        return card
+
+    def book(side, qty, price):
+        now = datetime.datetime.now(datetime.timezone.utc)
+        ticket.apply_fill(pf_path, cfg, sym, side, qty, price, today)
+        ticket.log_fill(state_path, now, today, sym, side, qty, price)
+
+    try:
+        ib = (connect or tws.connect)(cfg)
+    except Exception as e:
+        return fail(e)
+    try:
+        entry = tws.place_entry(ib, order)
+    except Exception as e:
+        return fail(e)
+    st = ticket.load_state(state_path)
+    st.setdefault("orders", []).append({"at": ticket.ny_iso(datetime.datetime.now(datetime.timezone.utc)), "date": today,
+                                        "status": "placed", "symbol": sym, "side": order.get("side", "buy"),
+                                        "qty": str(order.get("qty")), "broker_order_id": entry["order_id"],
+                                        "plain": "BUY %s %s, market, day (autopilot via TWS)" % (order.get("qty"), sym)})
+    write_json(state_path, st)
+    book("buy", entry["filled_qty"], entry["fill_price"])
+    try:
+        bracket = tws.attach_bracket(ib, order, entry["filled_qty"], entry["fill_price"], date=today,
+                                     entry_id=entry["order_id"])
+    except Exception as e:
+        return fail(e, unprotected=True)
+    card.update({"status": "placed", "broker": {"entry": entry, "bracket": bracket}})
+    write_json("trader/decision.json", card)
+    notifier("Autopilot: %s placed" % sym, "%s %s at %.2f, stop %.2f, target %.2f" % (
+        sym, _str(entry["filled_qty"]), entry["fill_price"], bracket["stop"], bracket["target"]))
+    try:
+        r = tws.hold(ib, bracket, cfg.get("flat_by") or "15:55", now_fn, on_fill=book)
+    except Exception as e:
+        return fail(e, unprotected=True)
+    finally:
+        try:
+            ib.disconnect()
+        except Exception:
+            pass
+    card.update({"status": "closed", "outcome": r["outcome"], "exit": r})
+    write_json("trader/decision.json", card)
+    notifier("Autopilot: %s %s" % (sym, r["outcome"]), "%s sold %s at %.2f" % (sym, _str(r["qty"]), r["price"]))
+    return card
+
+
+def _str(q):
+    return ("%g" % float(q))
+
+
 def main(argv=None):
-    ap = argparse.ArgumentParser(description="Autopilot: morning steps, watch picks, decision card. Never orders.")
+    ap = argparse.ArgumentParser(description="Autopilot: morning steps, watch picks, decision card; places on paper only with auto_place.")
     ap.add_argument("cmd", choices=["day", "morning", "watch"])
     ap.add_argument("--root", default=ROOT)
     ap.add_argument("--every", type=float, default=60)
@@ -262,6 +340,10 @@ def main(argv=None):
     if trig:
         card = decide(a.root, trig)
         print("decision: %s %s -> trader/decision.json" % (card["symbol"], card["status"]))
+        card = trade(a.root, card, cfg)
+        print("trade: %s %s%s" % (card["symbol"], card["status"], " " + card["outcome"] if card.get("outcome") else ""))
+        if card["status"] == "broker_error":
+            return 2
     return 0
 
 

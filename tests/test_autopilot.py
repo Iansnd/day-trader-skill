@@ -8,6 +8,7 @@ import unittest
 from _load import load
 
 ap = load("trader-autopilot", "autopilot")
+tws = load("trader-broker", "ibkr_tws")
 UTC = datetime.timezone.utc
 
 
@@ -245,6 +246,68 @@ class Decide(unittest.TestCase):
         ap.notify("Autopilot", "TSLA ready", runner=lambda argv, **kw: seen.append(argv) or ok())
         self.assertEqual(seen[0][0], "osascript")
         self.assertIn("TSLA ready", seen[0][2])
+
+
+from fake_ib import FakeIB   # noqa: E402
+
+ICE_ORDER = {"symbol": "ICE", "side": "buy", "qty": "16", "type": "market", "time_in_force": "day",
+             "order_class": "bracket", "stop_loss_stop_price": "166.51", "plan": {"stop": 166.51, "target_r": 2.0}}
+
+
+class Trade(unittest.TestCase):
+    def setUp(self):
+        self.cwd = os.getcwd()
+        self.d = tempfile.mkdtemp()
+        os.makedirs(os.path.join(self.d, "trader", "state"))
+        with open(os.path.join(self.d, "trader", "orders.json"), "w") as fh:
+            json.dump({"orders": [ICE_ORDER]}, fh)
+        with open(os.path.join(self.d, "trader", "portfolio.json"), "w") as fh:
+            json.dump({"cash": 10000.0, "positions": []}, fh)
+        self.notes = []
+        self.cfg = {"paper": True, "auto_place": True, "flat_by": "15:55"}
+        self.card = {"status": "ready", "symbol": "ICE", "reply_hint": "yes buy 16 ICE"}
+
+    def tearDown(self):
+        os.chdir(self.cwd)
+
+    def trade(self, ib, cfg=None, now="10:40"):
+        return ap.trade(self.d, dict(self.card), cfg or self.cfg, connect=lambda c: ib,
+                        now_fn=lambda: now, notifier=lambda t, b: self.notes.append((t, b)))
+
+    def read(self, rel):
+        with open(os.path.join(self.d, rel)) as fh:
+            return json.load(fh)
+
+    def test_trade_skipped_without_auto_place(self):
+        self.assertEqual(self.trade(FakeIB(), {"paper": True})["status"], "ready")
+        self.assertEqual(self.trade(FakeIB(), {"paper": False, "auto_place": True})["status"], "ready")
+        self.assertEqual(ap.trade(self.d, {"status": "blocked", "symbol": "ICE"}, self.cfg, connect=lambda c: FakeIB())["status"], "blocked")
+
+    def test_trade_places_books_and_holds(self):
+        ib = FakeIB(); ib.script += [("fill", 16, 168.79), ("fill_sell", "stop", 16, 166.40)]
+        card = self.trade(ib)
+        self.assertEqual((card["status"], card["outcome"]), ("closed", "stopped"))
+        self.assertEqual(card["broker"]["bracket"]["target"], 173.35)
+        self.assertEqual(self.read("trader/portfolio.json")["positions"], [])
+        log = self.read("trader/state/broker.json")["orders"]
+        self.assertEqual([(o["status"], o["side"]) for o in log], [("placed", "buy"), ("filled", "buy"), ("filled", "sell")])
+        self.assertIn("stop 166.51, target 173.35", self.notes[0][1])
+        self.assertEqual(self.read("trader/decision.json")["status"], "closed")
+
+    def test_bracket_failure_flags_unprotected(self):
+        ib = FakeIB(fail_on_sell=True); ib.script.append(("fill", 16, 168.79))
+        card = self.trade(ib)
+        self.assertEqual(card["status"], "broker_error")
+        self.assertTrue(card["unprotected"])
+        self.assertIn("NO stop", self.notes[-1][1])
+        self.assertEqual(self.read("trader/portfolio.json")["positions"][0]["shares"], 16)
+
+    def test_connect_failure_is_broker_error_not_unprotected(self):
+        def bad(c):
+            raise tws.TwsError("gateway down")
+        card = ap.trade(self.d, dict(self.card), self.cfg, connect=bad, now_fn=lambda: "10:40", notifier=lambda *a: None)
+        self.assertEqual(card["status"], "broker_error")
+        self.assertFalse(card.get("unprotected"))
 
 
 class Dashboard(unittest.TestCase):

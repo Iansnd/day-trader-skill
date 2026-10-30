@@ -13,8 +13,8 @@ class FakeIB:
     def __init__(self, positions=None, fail_on_sell=False):
         self.connected_to = None
         self._positions = positions or {}
-        self.script = []          # ("fill", qty, price) | ("fill_sell", order_id | "next_market", qty, price)
-        self.trades = []
+        self.script = []          # ("fill", qty, price) | ("fill_sell", order_id | "stop" | "target" | "next_market", qty, price)
+        self.trades_list = []
         self.cancelled = []
         self.fail_on_sell = fail_on_sell
         self.summary = {"AccountType": "PAPER", "NetLiquidation": "1000000.00"}
@@ -44,17 +44,20 @@ class FakeIB:
         self._next_id += 1
         t = _ns(contract=contract, order=order,
                 orderStatus=_ns(status="Submitted", filled=0.0, remaining=order.totalQuantity, avgFillPrice=0.0))
-        self.trades.append(t)
+        self.trades_list.append(t)
         return t
 
     def cancelOrder(self, order, **kw):
         self.cancelled.append(order.orderId)
-        for t in self.trades:
+        for t in self.trades_list:
             if t.order.orderId == order.orderId and t.orderStatus.status not in ("Filled",):
                 t.orderStatus.status = "Cancelled"
 
+    def trades(self):
+        return list(self.trades_list)
+
     def openTrades(self):
-        return [t for t in self.trades if t.orderStatus.status in ("Submitted", "PreSubmitted", "PendingSubmit")]
+        return [t for t in self.trades_list if t.orderStatus.status in ("Submitted", "PreSubmitted", "PendingSubmit")]
 
     def sleep(self, secs=0.02):
         if self.script:
@@ -70,7 +73,8 @@ class FakeIB:
         else:
             _, oid, qty, price = ev
             opens = [t for t in self.openTrades() if t.order.action == "SELL"]
-            t = next(t for t in opens if t.order.orderType == "MKT") if oid == "next_market" \
+            by_type = {"next_market": "MKT", "stop": "STP", "target": "LMT"}
+            t = next(t for t in opens if t.order.orderType == by_type[oid]) if oid in by_type \
                 else next(t for t in opens if t.order.orderId == oid)
         t.orderStatus.status, t.orderStatus.filled, t.orderStatus.remaining, t.orderStatus.avgFillPrice = \
             "Filled", float(qty), 0.0, float(price)
