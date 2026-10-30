@@ -53,6 +53,14 @@ What blocks an entry (on top):
                 3 hours earlier too)
   pdt           only with "pdt_guard": true: 3 day trades already in the last
                 5 business days (a 4th would trip the old pattern-day-trader rule)
+  regime        a buy while the market regime (config market_regime) equals
+                block_regime_long (default RISK_OFF)
+  jev           Jev's p_works for this symbol (trader/entry.json) under min_jev
+                (default 0.55), or no reading for this symbol
+  time machine  the Monte Carlo expected R for this plan (trader/timemachine.json)
+                under min_timemachine_r (default 0), or no replay for this symbol.
+                These three only run when the readings are supplied (always from
+                the command line; check() callers pass signals=None to skip them)
 
 Exit code 0 when every order passes, 1 when any order is blocked.
 The verdicts go to trader/state/risk.json with a fingerprint of each order,
@@ -74,6 +82,8 @@ DEFAULTS = {
     "no_entries_before": "09:45", "no_entries_after": "15:30", "flat_by": "15:55",
     "paper": True, "blocked": [], "allow_options": False, "allow_margin": False, "allow_short": False,
     "pdt_guard": False,
+    # research gates: the regime, Jev and Time Machine readings must agree before an entry passes
+    "block_regime_long": "RISK_OFF", "min_jev": 0.55, "min_timemachine_r": 0.0,
 }
 ALPACA_FIELDS = ("symbol", "side", "qty", "notional", "type", "time_in_force", "limit_price",
                  "stop_price", "trail_price", "trail_percent", "extended_hours", "client_order_id",
@@ -370,11 +380,47 @@ def day_trades(state, today):
 
 # ---------------------------------------------------------------- the check
 
-def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=None, price_times=None):
+def read_signals(entry_path="trader/entry.json", tm_path="trader/timemachine.json"):
+    """The research readings the gates compare against; a missing file is a missing reading."""
+    e = read_json(entry_path, "entry", required=False) or {}
+    t = read_json(tm_path, "time machine", required=False) or {}
+    return {"jev_symbol": str(e.get("symbol") or "").upper(), "jev": _f((e.get("jev") or {}).get("p_works")),
+            "tm_symbol": str((t.get("plan") or {}).get("symbol") or "").upper(),
+            "tm_avg_r": _f((t.get("mc") or {}).get("avg_R"))}
+
+
+def research_gates(sym, long, c, signals):
+    """Reasons an entry fails the regime, Jev and Time Machine gates. Empty when signals is None."""
+    if signals is None:
+        return []
+    out = []
+    bad = str(c.get("block_regime_long") or "").upper()
+    regime = str(c.get("market_regime") or "").upper()
+    if long and bad and regime == bad:
+        out.append("regime: the market regime is %s; longs are off (block_regime_long)" % regime)
+    min_jev = _f(c.get("min_jev"))
+    if min_jev:
+        if signals.get("jev_symbol") != sym or signals.get("jev") is None:
+            out.append("jev: no Jev reading for %s (run entry.py check %s); minimum is %s" % (sym, sym, _num(min_jev)))
+        elif signals["jev"] < min_jev - 1e-9:
+            out.append("jev: p_works %.2f for %s is under your minimum %s" % (signals["jev"], sym, _num(min_jev)))
+    min_r = _f(c.get("min_timemachine_r"))
+    if min_r is not None:
+        if signals.get("tm_symbol") != sym or signals.get("tm_avg_r") is None:
+            out.append("time machine: no replay for %s (run timemachine.py run --write)" % sym)
+        elif signals["tm_avg_r"] < min_r - 1e-9:
+            out.append("time machine: expected %+.2fR for this plan is under your minimum %+.2fR"
+                       % (signals["tm_avg_r"], min_r))
+    return out
+
+
+def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=None, price_times=None,
+          signals=None):
     """Pure function. Returns {"results": [...], "pass": n, "block": n, "warnings": [...]}.
 
     now          naive UTC (default: the real clock); its New York date is "today"
-    price_times  {SYM: naive UTC time of that price}; None = every price counts as fresh"""
+    price_times  {SYM: naive UTC time of that price}; None = every price counts as fresh
+    signals      read_signals(): regime / Jev / Time Machine gates run only when this is given"""
     c = dict(DEFAULTS)
     c.update(cfg or {})
     prices = {str(k).upper(): float(v) for k, v in (prices or {}).items() if _f(v)}
@@ -624,6 +670,7 @@ def check(orders, cfg, portfolio=None, prices=None, state=None, today=None, now=
                 later.append("trades: %d entries placed today plus %d passed earlier in this batch, your limit "
                              "is %d a day" % (len(entries_today), batch_entries, cap_t))
             later.extend(win_reasons)
+            later.extend(research_gates(sym, long, c, signals))
             if c.get("pdt_guard") and pdt_n >= 3:
                 later.append("pdt: %d day trades in the last 5 business days (%s); a 4th trips the "
                              "pattern-day-trader rule your broker applies (\"pdt_guard\": true)"
@@ -773,6 +820,9 @@ def main(argv=None):
                     help="your account; if missing, a fresh account funded with the budget")
     ap.add_argument("--prices", default="trader/prices.json")
     ap.add_argument("--state", default="trader/state/broker.json", help="what trader-broker placed today")
+    ap.add_argument("--entry", default="trader/entry.json", help="entry.py check output (Jev reading)")
+    ap.add_argument("--timemachine", default="trader/timemachine.json", help="timemachine.py run output")
+    ap.add_argument("--no-gates", action="store_true", help="skip the regime / Jev / Time Machine gates")
     ap.add_argument("--now", help="pretend it is this New York time, e.g. \"2026-10-19 10:15\"")
     ap.add_argument("--today", help="YYYY-MM-DD (default: today in New York)")
     ap.add_argument("--out", default="trader/state/risk.json", help="where the verdicts are recorded")
@@ -792,7 +842,8 @@ def main(argv=None):
         pdoc = read_json(a.prices, "prices", required=False) or {}
         prices, times = load_prices(pdoc)
         state = read_json(a.state, "broker state", required=False)
-        res = check(orders, cfg, portfolio, prices, state, a.today, now, times)
+        signals = None if a.no_gates else read_signals(a.entry, a.timemachine)
+        res = check(orders, cfg, portfolio, prices, state, a.today, now, times, signals)
         if pdoc.get("as_of"):
             res["prices_as_of"] = pdoc["as_of"]
         if not a.no_write:

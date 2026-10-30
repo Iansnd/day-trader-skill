@@ -32,6 +32,7 @@ def at(text):
 def cfg(**over):
     with open(CFG_PATH) as fh:
         c = json.load(fh)
+    c.update({"min_reward_risk": 1.0, "no_entries_after": "15:30"})   # the reel's TSLA fixture is a 1R trade
     c.update(over)
     return c
 
@@ -118,9 +119,12 @@ class TheReel(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             out = os.path.join(d, "state", "risk.json")
             none = os.path.join(d, "none")
+            cfg_path = os.path.join(d, "config.json")
+            with open(cfg_path, "w") as fh:
+                json.dump(cfg(), fh)   # the 1R fixture needs the test cfg(), not the stricter example config
             buf = io.StringIO()
             with redirect_stdout(buf):
-                code = check.main(["--orders", TSLA_PATH, "--config", CFG_PATH, "--portfolio", none,
+                code = check.main(["--orders", TSLA_PATH, "--config", cfg_path, "--portfolio", none, "--no-gates",
                                    "--prices", none, "--state", none, "--now", NOW, "--out", out])
             text = buf.getvalue()
             self.assertEqual(code, 0)
@@ -245,6 +249,29 @@ class DayTradeChecks(unittest.TestCase):
         self.assertEqual(verdicts(res), ["PASS"])
         with self.assertRaises(check.RiskError):
             self.one(tsla(), no_entries_before="9.45am")
+
+    def test_research_gates(self):
+        good = {"jev_symbol": "TSLA", "jev": 0.61, "tm_symbol": "TSLA", "tm_avg_r": 0.12}
+        gated = lambda sig, **over: check.check([tsla()], cfg(**over), now=at(NOW), signals=sig)
+        self.assertEqual(verdicts(gated(good, market_regime="RISK_ON")), ["PASS"])
+        self.assertEqual(verdicts(self.one(tsla(), market_regime="RISK_OFF")), ["PASS"])   # no signals, no gates
+        r = gated(good, market_regime="RISK_OFF")["results"][0]
+        self.assertEqual(r["verdict"], "BLOCK"); self.assertTrue(any(x.startswith("regime:") for x in r["reasons"]))
+        r = gated(dict(good, jev=0.43))["results"][0]
+        self.assertTrue(any(x.startswith("jev:") for x in r["reasons"]))
+        r = gated(dict(good, tm_avg_r=-0.03))["results"][0]
+        self.assertTrue(any(x.startswith("time machine:") for x in r["reasons"]))
+        r = gated(dict(good, jev_symbol="ICE", tm_symbol="ICE"))["results"][0]
+        self.assertEqual(sum(1 for x in r["reasons"] if x.startswith(("jev:", "time machine:"))), 2)
+        self.assertEqual(verdicts(gated(dict(good, jev=0.1, tm_avg_r=-1), min_jev=0, min_timemachine_r=None)), ["PASS"])
+
+    def test_read_signals_from_files(self):
+        with tempfile.TemporaryDirectory() as d:
+            e, t = os.path.join(d, "entry.json"), os.path.join(d, "tm.json")
+            self.assertEqual(check.read_signals(e, t)["jev"], None)
+            json.dump({"symbol": "ice", "jev": {"p_works": 0.43}}, open(e, "w"))
+            json.dump({"plan": {"symbol": "ICE"}, "mc": {"avg_R": -0.031}}, open(t, "w"))
+            self.assertEqual(check.read_signals(e, t), {"jev_symbol": "ICE", "jev": 0.43, "tm_symbol": "ICE", "tm_avg_r": -0.031})
 
     def test_the_window_uses_new_york_time_not_the_machine(self):
         self.assertEqual(check.to_eastern(at("2026-10-19 10:15")), datetime.datetime(2026, 10, 19, 10, 15))
@@ -469,8 +496,11 @@ class Cli(unittest.TestCase):
                            "detail": {"TSLA": {"time": "2026-10-19T14:52:13Z", "fetched": "2026-10-19T14:55:00Z"}}},
                           fh)
             none = os.path.join(d, "none")
-            base = ["--orders", TSLA_PATH, "--config", CFG_PATH, "--portfolio", none, "--prices", pp,
-                    "--state", none, "--no-write"]
+            cp = os.path.join(d, "config.json")
+            with open(cp, "w") as fh:
+                json.dump(cfg(), fh)
+            base = ["--orders", TSLA_PATH, "--config", cp, "--portfolio", none, "--prices", pp,
+                    "--state", none, "--no-write", "--no-gates"]
             buf = io.StringIO()
             with redirect_stdout(buf):
                 self.assertEqual(check.main(base + ["--now", "2026-10-19 10:55"]), 1)
@@ -488,7 +518,7 @@ class Cli(unittest.TestCase):
             buf = io.StringIO()
             with redirect_stdout(buf):
                 code = check.main(["--orders", V1_ORDERS_PATH, "--config", c, "--portfolio", none, "--prices", none,
-                                   "--state", none, "--today", V1_TODAY, "--out", out])
+                                   "--state", none, "--today", V1_TODAY, "--out", out, "--no-gates"])
             self.assertEqual(code, 0)
             self.assertIn("5 passed, 0 blocked", buf.getvalue())
             with open(out) as fh:

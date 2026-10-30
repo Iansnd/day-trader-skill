@@ -109,7 +109,11 @@ class Flow(unittest.TestCase):
         self.orders = os.path.join(self.d, "orders.json")
         shutil.copy(ORDERS_PATH, self.orders)
         self.cfg = os.path.join(self.d, "config.json")
-        shutil.copy(CFG_PATH, self.cfg)
+        with open(CFG_PATH) as fh:
+            c = json.load(fh)
+        c.update({"min_reward_risk": 1.0, "no_entries_after": "15:30"})   # the TSLA fixture is a 1R trade
+        with open(self.cfg, "w") as fh:
+            json.dump(c, fh)
         self.risk = os.path.join(self.d, "state", "risk.json")
         self.state = os.path.join(self.d, "state", "broker.json")
         self.pf = os.path.join(self.d, "portfolio.json")
@@ -125,7 +129,7 @@ class Flow(unittest.TestCase):
     def run_risk(self, now=NOW):
         with redirect_stdout(io.StringIO()):
             return check.main(["--orders", self.orders, "--config", self.cfg, "--portfolio", self.pf,
-                               "--prices", self.none, "--state", self.state, "--now", now, "--out", self.risk])
+                               "--prices", self.none, "--state", self.state, "--now", now, "--out", self.risk, "--no-gates"])
 
     def state_doc(self):
         with open(self.state) as fh:
