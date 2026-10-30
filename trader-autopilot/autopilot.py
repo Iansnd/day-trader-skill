@@ -24,10 +24,17 @@ SKILLS = "day-trader-skill"
 PY = sys.executable or "python3"
 
 
+def _tool(folder, name):
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", folder))
+    return __import__(name)
+
+
 def _news():
-    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "trader-news"))
-    import news
-    return news
+    return _tool("trader-news", "news")
+
+
+def _alerts():
+    return _tool("trader-alerts", "alerts")   # owns the NYSE holiday and early-close calendar
 
 
 def now_et(now=None):
@@ -35,8 +42,17 @@ def now_et(now=None):
 
 
 def is_trading_day(now=None):
-    # ponytail: weekdays only; NYSE holidays make an idle run, not a bad one.
-    return now_et(now).weekday() < 5
+    return _alerts().trading_day(now_et(now).date())[0]
+
+
+def entry_cutoff(cfg, now=None):
+    """config no_entries_after, pulled in to 30 minutes before a 1:00 p.m. early close."""
+    want = cfg.get("no_entries_after") or "15:30"
+    s = _alerts().session(now_et(now).date())
+    if not s:
+        return want
+    close = datetime.datetime.combine(datetime.date.today(), s[1]) - datetime.timedelta(minutes=30)
+    return min(want, close.strftime("%H:%M"))
 
 
 def already_ran_today(now=None):
@@ -67,6 +83,13 @@ def run_step(name, argv, timeout=900, runner=subprocess.run, ok_rcs=(0,)):
             "stdout": stdout}  # stdout: whole thing, for callers that parse JSON; tail is for the log
 
 
+def write_json(path, data):
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(data, fh, indent=2)
+    os.replace(tmp, path)   # the dashboard polls this file; never let it see a half-written one
+
+
 def load_json(path, default=None):
     try:
         with open(path, encoding="utf-8") as fh:
@@ -92,11 +115,10 @@ def morning(root, runner=subprocess.run, now=None, day_started=False):
         run_step("scan", [PY, script("trader-scanner", "scan.py"), "daily", "--quiet"], timeout=3600, runner=runner),
         run_step("news", [PY, script("trader-news", "news.py"), "--json", "--hours", "24"], runner=runner),
     ]
-    state = {"date": now_et(now).strftime("%Y-%m-%d"), "day_started": day_started, "steps": steps,
-             "picks": rank_picks(load_json("trader/watchlist.json"))}
+    picks = rank_picks(load_json("trader/watchlist.json")) if steps[1]["ok"] else []   # a failed scan leaves yesterday's list
+    state = {"date": now_et(now).strftime("%Y-%m-%d"), "day_started": day_started, "steps": steps, "picks": picks}
     os.makedirs("trader/state", exist_ok=True)
-    with open("trader/state/autopilot.json", "w", encoding="utf-8") as fh:
-        json.dump(state, fh, indent=2)
+    write_json("trader/state/autopilot.json", state)
     return state
 
 
@@ -134,9 +156,11 @@ def watch(root, picks, until="15:30", every=60, runner=subprocess.run, now_fn=no
             return None
         fired = [p["symbol"] for p in picks if fresh_trigger(check_entry(p["symbol"], runner=runner))]
         if fired:
-            res = check_entry(fired[0], write=True, runner=runner) or {"symbol": fired[0], "status": "triggered"}
-            res["also_triggered"] = fired[1:]
-            return res
+            res = check_entry(fired[0], write=True, runner=runner)
+            if res and res.get("symbol") == fired[0]:
+                res["also_triggered"] = fired[1:]
+                return res
+            # the --write re-check failed, so trader/entry.json is not this symbol; exit.py would plan the wrong one
         if every:
             time.sleep(every)
 
@@ -200,8 +224,7 @@ def decide(root, trigger, runner=subprocess.run, now=None, notifier=notify):
             "ticket_text": ticket_text, "also_triggered": trigger.get("also_triggered", []),
             "portfolio_age_hours": age,
             "reply_hint": "yes %s %s %s" % (first.get("side", "buy"), first.get("qty", "?"), sym)}
-    with open("trader/decision.json", "w", encoding="utf-8") as fh:
-        json.dump(card, fh, indent=2)
+    write_json("trader/decision.json", card)
     notifier("Autopilot: %s %s" % (sym, status), {"ready": "Ticket ready. Open the dashboard, then say: " + card["reply_hint"],
                                                "blocked": "Risk check blocked it.",
                                                "stale_account": "Sync the IBKR account in Claude first.",
@@ -215,25 +238,26 @@ def main(argv=None):
     ap.add_argument("--root", default=ROOT)
     ap.add_argument("--every", type=float, default=60)
     a = ap.parse_args(argv)
+    sys.stdout.reconfigure(line_buffering=True)   # launchd log, readable while it runs
     os.chdir(a.root)
     if not is_trading_day():
         print("autopilot: not a trading day, nothing to do.")
         return 0
     if a.cmd == "day":
         if already_ran_today():
-            print("autopilot: already ran today, nothing to do.", flush=True)
+            print("autopilot: already ran today, nothing to do.")
             return 0
         if (now_et().hour, now_et().minute) < (9, 0):
-            print("autopilot: before 9:00 New York (the 15:00 SAST fire in winter), the next fire does it.", flush=True)
+            print("autopilot: before 9:00 New York (the 15:00 SAST fire in winter), the next fire does it.")
             return 0
     state = morning(a.root, day_started=a.cmd == "day") if a.cmd in ("day", "morning") else load_json("trader/state/autopilot.json", {})
     for s in state.get("steps", []):
-        print("%-7s %s %ss" % (s["name"], "ok" if s["ok"] else "FAIL rc=%s" % s["rc"], s["seconds"]), flush=True)
-    print("picks: " + ", ".join(p["symbol"] for p in state.get("picks", [])), flush=True)
+        print("%-7s %s %ss" % (s["name"], "ok" if s["ok"] else "FAIL rc=%s" % s["rc"], s["seconds"]))
+    print("picks: " + ", ".join(p["symbol"] for p in state.get("picks", [])))
     if a.cmd == "morning":
         return 0
     cfg = load_json("trader/config.json", {})
-    trig = watch(a.root, state.get("picks", []), until=cfg.get("no_entries_after") or "15:30", every=a.every)
+    trig = watch(a.root, state.get("picks", []), until=entry_cutoff(cfg), every=a.every)
     print("trigger: %s" % (trig["symbol"] if trig else "none"))
     if trig:
         card = decide(a.root, trig)

@@ -94,6 +94,26 @@ class Morning(unittest.TestCase):
     def test_skips_non_trading_day(self):
         self.assertFalse(ap.is_trading_day(datetime.datetime(2026, 11, 1, 14, 0, tzinfo=UTC)))  # Sunday
         self.assertTrue(ap.is_trading_day(datetime.datetime(2026, 10, 30, 14, 0, tzinfo=UTC)))  # Friday
+        self.assertFalse(ap.is_trading_day(datetime.datetime(2026, 11, 26, 14, 0, tzinfo=UTC)))  # Thanksgiving
+
+    def test_entry_cutoff_pulls_in_on_early_close(self):
+        cfg = {"no_entries_after": "15:30"}
+        self.assertEqual(ap.entry_cutoff(cfg, datetime.datetime(2026, 10, 30, 14, 0, tzinfo=UTC)), "15:30")
+        self.assertEqual(ap.entry_cutoff(cfg, datetime.datetime(2026, 11, 27, 14, 0, tzinfo=UTC)), "12:30")  # 1 p.m. close
+
+    def test_failed_scan_leaves_no_picks(self):
+        with tempfile.TemporaryDirectory() as d:
+            os.makedirs(os.path.join(d, "trader", "state"))
+            with open(os.path.join(d, "trader", "watchlist.json"), "w") as fh:
+                json.dump({"hits": [{"symbol": "OLD", "jev": {"quality": 2}}]}, fh)   # yesterday's list
+
+            def fake(argv, **kw):
+                if "scan.py" in argv[1]:
+                    return types.SimpleNamespace(returncode=1, stdout="", stderr="yahoo down")
+                return ok("{}")
+            state = ap.morning(d, runner=fake)
+            self.assertEqual(state["picks"], [])
+            self.assertFalse(os.path.exists(os.path.join(d, "trader", "state", "autopilot.json.tmp")))
 
 
 PICKS = [{"symbol": s, "quality": q, "setups": ["orb"]} for s, q in (("A", 3), ("B", 2), ("C", 1))]
@@ -125,6 +145,15 @@ class Watch(unittest.TestCase):
         def fake(argv, **kw):
             return ok(json.dumps({"symbol": argv[3], "status": "triggered", "minutes_since": 240}))
         clock = iter([T1000, T1531])
+        self.assertIsNone(ap.watch(".", PICKS, until="15:30", every=0, runner=fake, now_fn=lambda: next(clock)))
+
+    def test_watch_keeps_polling_when_the_write_recheck_fails(self):
+        clock = iter([T1000, T1000, T1531])
+
+        def fake(argv, **kw):
+            if "--write" in argv:
+                return types.SimpleNamespace(returncode=1, stdout="", stderr="chart stale")
+            return ok(json.dumps({"symbol": argv[3], "status": "triggered", "minutes_since": 1}))
         self.assertIsNone(ap.watch(".", PICKS, until="15:30", every=0, runner=fake, now_fn=lambda: next(clock)))
 
     def test_watch_stops_at_until(self):
