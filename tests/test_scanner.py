@@ -490,6 +490,9 @@ class Cli(unittest.TestCase):
             return json.load(fh)
 
     def test_universe_daily_orb_end_to_end(self):
+        cwd = os.getcwd()
+        os.chdir(self.d)  # keep the real trader/.env out of the scan, or Jev tags the hits
+        self.addCleanup(os.chdir, cwd)
         uni = os.path.join(self.t, "universe.txt")
         code, text, _ = run(["universe", "--offline", SYMDIR, "--out", uni])
         self.assertEqual(code, 0)

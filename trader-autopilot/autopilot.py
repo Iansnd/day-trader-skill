@@ -47,13 +47,14 @@ def run_step(name, argv, timeout=900, runner=subprocess.run):
     t0 = time.time()
     try:
         r = runner(argv, capture_output=True, text=True, timeout=timeout)
-        rc, out = r.returncode, (r.stdout or "") + (r.stderr or "")
+        rc, out, stdout = r.returncode, (r.stdout or "") + (r.stderr or ""), r.stdout or ""
     except subprocess.TimeoutExpired:
-        rc, out = -1, "timed out after %ss" % timeout
+        rc, out, stdout = -1, "timed out after %ss" % timeout, ""
     except OSError as e:
-        rc, out = -2, str(e)
+        rc, out, stdout = -2, str(e), ""
     tail = "\n".join(out.strip().splitlines()[-20:])
-    return {"name": name, "ok": rc == 0, "rc": rc, "seconds": round(time.time() - t0, 1), "tail": tail}
+    return {"name": name, "ok": rc == 0, "rc": rc, "seconds": round(time.time() - t0, 1), "tail": tail,
+            "stdout": stdout}  # stdout: whole thing, for callers that parse JSON; tail is for the log
 
 
 def load_json(path, default=None):
@@ -87,8 +88,39 @@ def morning(root, runner=subprocess.run, now=None):
     return state
 
 
+def _hhmm(text):
+    h, m = (text or "15:30").split(":")
+    return int(h), int(m)
+
+
+def check_entry(symbol, write=False, runner=subprocess.run):
+    """entry.py check SYMBOL --setup orb [--write] -> its JSON, or None when it failed."""
+    argv = [PY, script("trader-entry", "entry.py"), "check", symbol, "--setup", "orb", "--json"]
+    if write:
+        argv.append("--write")
+    r = run_step("entry:" + symbol, argv, timeout=120, runner=runner)
+    try:
+        return json.loads(r["stdout"]) if r["stdout"].lstrip().startswith("{") else None
+    except ValueError:
+        return None
+
+
 def watch(root, picks, until="15:30", every=60, runner=subprocess.run, now_fn=now_et):
-    return None  # Task 2
+    """Poll every pick's ORB setup; the first trigger by rank wins. None at the cutoff."""
+    os.chdir(root)
+    cutoff = _hhmm(until)
+    while True:
+        t = now_fn()
+        if (t.hour, t.minute) >= cutoff:
+            return None
+        fired = [p["symbol"] for p in picks
+                 if (check_entry(p["symbol"], runner=runner) or {}).get("status") == "triggered"]
+        if fired:
+            res = check_entry(fired[0], write=True, runner=runner) or {"symbol": fired[0], "status": "triggered"}
+            res["also_triggered"] = fired[1:]
+            return res
+        if every:
+            time.sleep(every)
 
 
 def main(argv=None):

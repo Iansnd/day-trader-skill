@@ -44,6 +44,9 @@ class XChannel(unittest.TestCase):
             wl = os.path.join(d, "wl.json")
             json.dump({"hits": [{"symbol": "MU"}]}, open(wl, "w"))
             src = {"x": {"max_searches": 1, "watchlist": wl}}
+            cwd = os.getcwd()
+            os.chdir(d)  # no trader/.env here, so "no key" really means no key
+            self.addCleanup(os.chdir, cwd)
             os.environ["XAI_API_KEY"] = "k"
             doc, state = s2.run(src, {}, now=NOW, post=fake_post)
             self.assertEqual(len(doc["x"]), 1)
