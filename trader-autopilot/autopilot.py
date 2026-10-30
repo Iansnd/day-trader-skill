@@ -39,6 +39,12 @@ def is_trading_day(now=None):
     return now_et(now).weekday() < 5
 
 
+def already_ran_today(now=None):
+    # ponytail: the plist fires at 15:00 and 16:00 local (9:00 ET across the DST gap) and launchd
+    # refires missed jobs on wake; today's state file means the morning already happened.
+    return (load_json("trader/state/autopilot.json", {}) or {}).get("date") == now_et(now).strftime("%Y-%m-%d")
+
+
 def script(folder, name):
     return os.path.join(SKILLS, folder, name)
 
@@ -123,6 +129,74 @@ def watch(root, picks, until="15:30", every=60, runner=subprocess.run, now_fn=no
             time.sleep(every)
 
 
+def notify(title, body, runner=subprocess.run):
+    q = lambda t: str(t).replace("\\", "").replace('"', "'")
+    try:
+        runner(["osascript", "-e", 'display notification "%s" with title "%s"' % (q(body), q(title))],
+               capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        pass  # a missing osascript (not macOS) is not a reason to lose the card
+
+
+def portfolio_age_hours(path="trader/portfolio.json", now=None):
+    stamp = (load_json(path, {}) or {}).get("synced_at") or ""
+    try:
+        t = datetime.datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc)
+    except ValueError:
+        return None
+    return round(((now or datetime.datetime.now(datetime.timezone.utc)) - t).total_seconds() / 3600, 1)
+
+
+def decide(root, trigger, runner=subprocess.run, now=None, notifier=notify):
+    """Trigger -> the whole pre-order chain -> trader/decision.json. Never orders."""
+    os.chdir(root)
+    sym = trigger["symbol"]
+    chain = [
+        ("exit", [PY, script("trader-exit", "exit.py"), "plan", "--stop", "or-mid", "--target", "2R", "--write"]),
+        ("timemachine", [PY, script("trader-timemachine", "timemachine.py"), "run", "--write"]),
+        ("size", [PY, script("trader-budget", "size.py"), "--write"]),
+        ("check", [PY, script("trader-risk", "check.py"), "--json"]),
+        ("ticket", [PY, script("trader-broker", "ticket.py"), "show"]),
+    ]
+    steps, risk, ticket_text = [], None, ""
+    for name, argv in chain:
+        r = run_step(name, argv, timeout=600, runner=runner)
+        steps.append(r)
+        if name == "check":
+            try:
+                risk = json.loads(r["stdout"]) if r["stdout"].lstrip().startswith("{") else None
+            except ValueError:
+                risk = None
+            r["ok"] = risk is not None  # check.py exits 1 on BLOCK; that is a verdict, not a failure
+        elif name == "ticket":
+            ticket_text = r["stdout"]
+        if not r["ok"]:
+            break
+    age = portfolio_age_hours(now=now)
+    orders = (load_json("trader/orders.json", {}) or {}).get("orders") or []
+    first = orders[0] if orders else {}
+    if not all(s["ok"] for s in steps) or len(steps) < len(chain):
+        status = "error"
+    elif risk.get("block"):
+        status = "blocked"
+    elif age is None or age > 24:
+        status = "stale_account"
+    else:
+        status = "ready"
+    card = {"created_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "symbol": sym, "status": status, "trigger": trigger, "steps": steps, "risk": risk,
+            "ticket_text": ticket_text, "also_triggered": trigger.get("also_triggered", []),
+            "portfolio_age_hours": age,
+            "reply_hint": "yes %s %s %s" % (first.get("side", "buy"), first.get("qty", "?"), sym)}
+    with open("trader/decision.json", "w", encoding="utf-8") as fh:
+        json.dump(card, fh, indent=2)
+    notifier("Autopilot: %s %s" % (sym, status), {"ready": "Ticket ready. Open the dashboard, then say: " + card["reply_hint"],
+                                               "blocked": "Risk check blocked it.",
+                                               "stale_account": "Sync the IBKR account in Claude first.",
+                                               "error": "A step failed; see the card."}[status])
+    return card
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Autopilot: morning steps, watch picks, decision card. Never orders.")
     ap.add_argument("cmd", choices=["day", "morning", "watch"])
@@ -133,6 +207,9 @@ def main(argv=None):
     if not is_trading_day():
         print("autopilot: not a trading day, nothing to do.")
         return 0
+    if a.cmd == "day" and already_ran_today():
+        print("autopilot: already ran today, nothing to do.")
+        return 0
     state = morning(a.root) if a.cmd in ("day", "morning") else load_json("trader/state/autopilot.json", {})
     for s in state.get("steps", []):
         print("%-7s %s %ss" % (s["name"], "ok" if s["ok"] else "FAIL rc=%s" % s["rc"], s["seconds"]))
@@ -142,6 +219,9 @@ def main(argv=None):
     cfg = load_json("trader/config.json", {})
     trig = watch(a.root, state.get("picks", []), until=cfg.get("no_entries_after") or "15:30", every=a.every)
     print("trigger: %s" % (trig["symbol"] if trig else "none"))
+    if trig:
+        card = decide(a.root, trig)
+        print("decision: %s %s -> trader/decision.json" % (card["symbol"], card["status"]))
     return 0
 
 

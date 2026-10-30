@@ -57,6 +57,19 @@ class Morning(unittest.TestCase):
             with open(os.path.join(d, "trader", "state", "autopilot.json")) as fh:
                 self.assertEqual(json.load(fh)["picks"], state["picks"])
 
+    def test_already_ran_today(self):
+        with tempfile.TemporaryDirectory() as d:
+            os.makedirs(os.path.join(d, "trader", "state"))
+            os.chdir(d)
+            today = ap.now_et().strftime("%Y-%m-%d")
+            self.assertFalse(ap.already_ran_today())
+            with open("trader/state/autopilot.json", "w") as fh:
+                json.dump({"date": today, "steps": [], "picks": []}, fh)
+            self.assertTrue(ap.already_ran_today())
+            with open("trader/state/autopilot.json", "w") as fh:
+                json.dump({"date": "2020-01-01"}, fh)
+            self.assertFalse(ap.already_ran_today())
+
     def test_skips_non_trading_day(self):
         self.assertFalse(ap.is_trading_day(datetime.datetime(2026, 11, 1, 14, 0, tzinfo=UTC)))  # Sunday
         self.assertTrue(ap.is_trading_day(datetime.datetime(2026, 10, 30, 14, 0, tzinfo=UTC)))  # Friday
@@ -98,6 +111,97 @@ class Watch(unittest.TestCase):
         def fake(argv, **kw):
             return ok(json.dumps({"symbol": argv[3], "status": "waiting"}))
         self.assertIsNone(ap.watch(".", PICKS, until="15:30", every=0, runner=fake, now_fn=lambda: next(clock)))
+
+
+def chain_runner(check_json, orders=None):
+    """Fake runner for the ticket chain; records argv and plays back check.py's JSON."""
+    calls = []
+
+    def fake(argv, **kw):
+        calls.append(argv)
+        name = os.path.basename(argv[1])
+        if name == "check.py":
+            return ok(json.dumps(check_json))
+        if name == "ticket.py":
+            return ok("#1 buy 8 TSLA @ market\nJev: act\n")
+        if name == "size.py" and orders is not None:
+            with open("trader/orders.json", "w") as fh:
+                json.dump({"orders": orders}, fh)
+        return ok("")
+    fake.calls = calls
+    return fake
+
+
+class Decide(unittest.TestCase):
+    def setUp(self):
+        self.cwd = os.getcwd()
+        self.d = tempfile.mkdtemp()
+        os.makedirs(os.path.join(self.d, "trader", "state"))
+        self.portfolio(hours_ago=1)
+
+    def tearDown(self):
+        os.chdir(self.cwd)
+
+    def portfolio(self, hours_ago):
+        t = datetime.datetime.now(UTC) - datetime.timedelta(hours=hours_ago)
+        with open(os.path.join(self.d, "trader", "portfolio.json"), "w") as fh:
+            json.dump({"cash": 1e6, "synced_at": t.strftime("%Y-%m-%dT%H:%M:%SZ")}, fh)
+
+    def card(self):
+        with open(os.path.join(self.d, "trader", "decision.json")) as fh:
+            return json.load(fh)
+
+    TRIG = {"symbol": "TSLA", "status": "triggered", "price": 364.2, "also_triggered": ["NVDA"]}
+
+    def test_decide_ready_card_has_reply_hint(self):
+        fake = chain_runner({"pass": 1, "block": 0, "results": [{"verdict": "PASS"}]},
+                            orders=[{"symbol": "TSLA", "side": "buy", "qty": 8}])
+        card = ap.decide(self.d, self.TRIG, runner=fake, notifier=lambda *a: None)
+        self.assertEqual(card["status"], "ready")
+        self.assertEqual(card["reply_hint"], "yes buy 8 TSLA")
+        self.assertEqual(card["also_triggered"], ["NVDA"])
+        self.assertIn("Jev: act", card["ticket_text"])
+        self.assertEqual([os.path.basename(c[1]) for c in fake.calls],
+                         ["exit.py", "timemachine.py", "size.py", "check.py", "ticket.py"])
+        self.assertEqual(self.card()["symbol"], "TSLA")
+
+    def test_decide_marks_blocked_when_check_blocks(self):
+        fake = chain_runner({"pass": 0, "block": 1, "results": [{"verdict": "BLOCK", "reasons": ["over max loss"]}]})
+        card = ap.decide(self.d, self.TRIG, runner=fake, notifier=lambda *a: None)
+        self.assertEqual(card["status"], "blocked")
+
+    def test_decide_marks_stale_account(self):
+        self.portfolio(hours_ago=30)
+        fake = chain_runner({"pass": 1, "block": 0, "results": [{"verdict": "PASS"}]})
+        card = ap.decide(self.d, self.TRIG, runner=fake, notifier=lambda *a: None)
+        self.assertEqual(card["status"], "stale_account")
+        self.assertGreater(card["portfolio_age_hours"], 24)
+
+    def test_decide_marks_error_when_a_step_fails(self):
+        def fake(argv, **kw):
+            return types.SimpleNamespace(returncode=1, stdout="", stderr="no plan")
+        card = ap.decide(self.d, self.TRIG, runner=fake, notifier=lambda *a: None)
+        self.assertEqual(card["status"], "error")
+
+    def test_notify_uses_osascript(self):
+        seen = []
+        ap.notify("Autopilot", "TSLA ready", runner=lambda argv, **kw: seen.append(argv) or ok())
+        self.assertEqual(seen[0][0], "osascript")
+        self.assertIn("TSLA ready", seen[0][2])
+
+
+class Dashboard(unittest.TestCase):
+    def test_dashboard_snapshot_includes_decision(self):
+        import importlib.util
+        root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        spec = importlib.util.spec_from_file_location("dashboard", os.path.join(root, "dashboard.py"))
+        dash = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(dash)
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "decision.json"), "w") as fh:
+                json.dump({"symbol": "TSLA", "status": "ready"}, fh)
+            self.assertEqual(dash.snapshot(d)["decision"]["symbol"], "TSLA")
+        self.assertIn("decision", dash.PAGE)
 
 
 if __name__ == "__main__":
