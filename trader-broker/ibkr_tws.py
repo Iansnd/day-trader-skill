@@ -184,14 +184,48 @@ def cmd_ping(a):
     return 0
 
 
+def cmd_rehearse(a):
+    """One tiny round trip through the real code path: entry, OCA bracket from the fill, hold, flatten."""
+    import datetime
+    with open(a.config, encoding="utf-8") as fh:
+        cfg = json.load(fh)
+    ib = connect(cfg)
+    try:
+        if not (ib.managedAccounts() or ["?"])[0].startswith("DU"):
+            raise TwsError("not a paper account")
+        order = {"symbol": a.symbol, "side": "buy", "qty": a.qty, "type": "market"}
+        entry = place_entry(ib, order)
+        print("entry: filled %g %s at %.2f (order %s)" % (entry["filled_qty"], a.symbol, entry["fill_price"], entry["order_id"]))
+        stop = round(entry["fill_price"] * (1 - a.stop_pct / 100.0), 2)
+        order["plan"] = {"stop": stop, "target_r": a.target_r}
+        bracket = attach_bracket(ib, order, entry["filled_qty"], entry["fill_price"], entry_id=entry["order_id"])
+        print("bracket: stop %.2f target %.2f oca %s" % (bracket["stop"], bracket["target"], bracket["oca_group"]))
+        now_et = lambda: datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=-4)))   # ponytail: EDT; rehearsal only
+        flat_by = (now_et() + datetime.timedelta(minutes=a.flat_in)).strftime("%H:%M")
+        print("holding until %s ET or an exit fill" % flat_by)
+        r = hold(ib, bracket, flat_by, now_et, every=5, on_fill=lambda s, q, p: print("fill: %s %g at %.2f" % (s, q, p)))
+        print("%s %g %s at %.2f" % (r["outcome"], r["qty"], a.symbol, r["price"]))
+        left = [t for t in ib.openTrades() if t.contract.symbol == a.symbol.upper()]
+        print("open %s orders left: %d" % (a.symbol, len(left)))
+        return 0 if not left else 1
+    finally:
+        ib.disconnect()
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--config", default="trader/config.json")
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("ping")
+    r = sub.add_parser("rehearse", help="one-share paper round trip: entry, OCA bracket, hold, flatten")
+    r.add_argument("--symbol", default="SPY")
+    r.add_argument("--qty", type=int, default=1)
+    r.add_argument("--stop-pct", type=float, default=1.0)
+    r.add_argument("--target-r", type=float, default=2.0)
+    r.add_argument("--flat-in", type=float, default=3, help="minutes until the flat-by")
     a = ap.parse_args(argv)
     try:
-        return {"ping": cmd_ping}[a.cmd](a)
+        return {"ping": cmd_ping, "rehearse": cmd_rehearse}[a.cmd](a)
     except TwsError as e:
         print("ibkr_tws: %s" % e, file=sys.stderr)
         return 2
