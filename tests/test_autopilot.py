@@ -37,6 +37,24 @@ class Morning(unittest.TestCase):
         self.assertEqual(r["rc"], 2)
         self.assertIn("boom", r["tail"])
 
+    def test_regime_exit_1_is_a_verdict_not_a_failure(self):
+        with tempfile.TemporaryDirectory() as d:
+            os.makedirs(os.path.join(d, "trader", "state"))
+
+            def fake(argv, **kw):
+                if "regime.py" in argv[1]:
+                    return types.SimpleNamespace(returncode=1, stdout="market_regime = RISK_OFF\n", stderr="")
+                return ok("{}")
+            self.assertTrue(ap.morning(d, runner=fake)["steps"][0]["ok"])
+
+    def test_morning_clears_yesterdays_card(self):
+        with tempfile.TemporaryDirectory() as d:
+            os.makedirs(os.path.join(d, "trader", "state"))
+            card = os.path.join(d, "trader", "decision.json")
+            open(card, "w").write("{}")
+            ap.morning(d, runner=lambda argv, **kw: ok("{}"))
+            self.assertFalse(os.path.exists(card))
+
     def test_morning_writes_state_and_continues_after_failure(self):
         with tempfile.TemporaryDirectory() as d:
             os.makedirs(os.path.join(d, "trader", "state"))
@@ -65,6 +83,9 @@ class Morning(unittest.TestCase):
             self.assertFalse(ap.already_ran_today())
             with open("trader/state/autopilot.json", "w") as fh:
                 json.dump({"date": today, "steps": [], "picks": []}, fh)
+            self.assertFalse(ap.already_ran_today())   # a manual `morning` must not eat the scheduled day
+            with open("trader/state/autopilot.json", "w") as fh:
+                json.dump({"date": today, "day_started": True}, fh)
             self.assertTrue(ap.already_ran_today())
             with open("trader/state/autopilot.json", "w") as fh:
                 json.dump({"date": "2020-01-01"}, fh)
@@ -100,6 +121,12 @@ class Watch(unittest.TestCase):
         self.assertEqual(r["also_triggered"], ["C"])
         self.assertTrue(any("--write" in c for c in calls if c[3] == "B"))
 
+    def test_watch_ignores_a_trigger_older_than_three_bars(self):
+        def fake(argv, **kw):
+            return ok(json.dumps({"symbol": argv[3], "status": "triggered", "minutes_since": 240}))
+        clock = iter([T1000, T1531])
+        self.assertIsNone(ap.watch(".", PICKS, until="15:30", every=0, runner=fake, now_fn=lambda: next(clock)))
+
     def test_watch_stops_at_until(self):
         def must_not_call(argv, **kw):
             raise AssertionError("polled after the cutoff")
@@ -123,7 +150,8 @@ def chain_runner(check_json, orders=None):
         if name == "check.py":
             return ok(json.dumps(check_json))
         if name == "ticket.py":
-            return ok("#1 buy 8 TSLA @ market\nJev: act\n")
+            rc = 1 if check_json.get("block") else 0   # ticket.py show exits 1 when no ticket is READY
+            return types.SimpleNamespace(returncode=rc, stdout="#1 buy 8 TSLA @ market\nJev: act\n", stderr="")
         if name == "size.py" and orders is not None:
             with open("trader/orders.json", "w") as fh:
                 json.dump({"orders": orders}, fh)

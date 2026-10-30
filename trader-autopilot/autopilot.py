@@ -42,14 +42,18 @@ def is_trading_day(now=None):
 def already_ran_today(now=None):
     # ponytail: the plist fires at 15:00 and 16:00 local (9:00 ET across the DST gap) and launchd
     # refires missed jobs on wake; today's state file means the morning already happened.
-    return (load_json("trader/state/autopilot.json", {}) or {}).get("date") == now_et(now).strftime("%Y-%m-%d")
+    st = load_json("trader/state/autopilot.json", {}) or {}
+    return bool(st.get("day_started")) and st.get("date") == now_et(now).strftime("%Y-%m-%d")
 
 
 def script(folder, name):
     return os.path.join(SKILLS, folder, name)
 
 
-def run_step(name, argv, timeout=900, runner=subprocess.run):
+VERDICT_RC = (0, 1)   # regime.py, check.py and ticket.py exit 1 to say RISK_OFF / BLOCK / not READY
+
+
+def run_step(name, argv, timeout=900, runner=subprocess.run, ok_rcs=(0,)):
     t0 = time.time()
     try:
         r = runner(argv, capture_output=True, text=True, timeout=timeout)
@@ -59,7 +63,7 @@ def run_step(name, argv, timeout=900, runner=subprocess.run):
     except OSError as e:
         rc, out, stdout = -2, str(e), ""
     tail = "\n".join(out.strip().splitlines()[-20:])
-    return {"name": name, "ok": rc == 0, "rc": rc, "seconds": round(time.time() - t0, 1), "tail": tail,
+    return {"name": name, "ok": rc in ok_rcs and bool(stdout.strip() or rc == 0), "rc": rc, "seconds": round(time.time() - t0, 1), "tail": tail,
             "stdout": stdout}  # stdout: whole thing, for callers that parse JSON; tail is for the log
 
 
@@ -79,14 +83,16 @@ def rank_picks(watchlist, n=5):
     return rows[:n]
 
 
-def morning(root, runner=subprocess.run, now=None):
+def morning(root, runner=subprocess.run, now=None, day_started=False):
     os.chdir(root)
+    if os.path.exists("trader/decision.json"):
+        os.remove("trader/decision.json")   # yesterday's card is not today's instruction
     steps = [
-        run_step("regime", [PY, script("trader-scanner", "regime.py")], runner=runner),
+        run_step("regime", [PY, script("trader-scanner", "regime.py")], runner=runner, ok_rcs=VERDICT_RC),
         run_step("scan", [PY, script("trader-scanner", "scan.py"), "daily", "--quiet"], timeout=3600, runner=runner),
         run_step("news", [PY, script("trader-news", "news.py"), "--json", "--hours", "24"], runner=runner),
     ]
-    state = {"date": now_et(now).strftime("%Y-%m-%d"), "steps": steps,
+    state = {"date": now_et(now).strftime("%Y-%m-%d"), "day_started": day_started, "steps": steps,
              "picks": rank_picks(load_json("trader/watchlist.json"))}
     os.makedirs("trader/state", exist_ok=True)
     with open("trader/state/autopilot.json", "w", encoding="utf-8") as fh:
@@ -111,16 +117,22 @@ def check_entry(symbol, write=False, runner=subprocess.run):
         return None
 
 
+MAX_TRIGGER_AGE_MIN = 15   # three 5-minute bars; entry.py reports a breakout all day, we only want a fresh one
+
+
+def fresh_trigger(res):
+    return bool(res) and res.get("status") == "triggered" and res.get("minutes_since", 0) <= MAX_TRIGGER_AGE_MIN
+
+
 def watch(root, picks, until="15:30", every=60, runner=subprocess.run, now_fn=now_et):
-    """Poll every pick's ORB setup; the first trigger by rank wins. None at the cutoff."""
+    """Poll every pick's ORB setup; the first fresh trigger by rank wins. None at the cutoff."""
     os.chdir(root)
     cutoff = _hhmm(until)
     while True:
         t = now_fn()
         if (t.hour, t.minute) >= cutoff:
             return None
-        fired = [p["symbol"] for p in picks
-                 if (check_entry(p["symbol"], runner=runner) or {}).get("status") == "triggered"]
+        fired = [p["symbol"] for p in picks if fresh_trigger(check_entry(p["symbol"], runner=runner))]
         if fired:
             res = check_entry(fired[0], write=True, runner=runner) or {"symbol": fired[0], "status": "triggered"}
             res["also_triggered"] = fired[1:]
@@ -160,14 +172,14 @@ def decide(root, trigger, runner=subprocess.run, now=None, notifier=notify):
     ]
     steps, risk, ticket_text = [], None, ""
     for name, argv in chain:
-        r = run_step(name, argv, timeout=600, runner=runner)
+        r = run_step(name, argv, timeout=600, runner=runner, ok_rcs=VERDICT_RC if name in ("check", "ticket") else (0,))
         steps.append(r)
         if name == "check":
             try:
                 risk = json.loads(r["stdout"]) if r["stdout"].lstrip().startswith("{") else None
             except ValueError:
                 risk = None
-            r["ok"] = risk is not None  # check.py exits 1 on BLOCK; that is a verdict, not a failure
+            r["ok"] = risk is not None
         elif name == "ticket":
             ticket_text = r["stdout"]
         if not r["ok"]:
@@ -207,13 +219,17 @@ def main(argv=None):
     if not is_trading_day():
         print("autopilot: not a trading day, nothing to do.")
         return 0
-    if a.cmd == "day" and already_ran_today():
-        print("autopilot: already ran today, nothing to do.")
-        return 0
-    state = morning(a.root) if a.cmd in ("day", "morning") else load_json("trader/state/autopilot.json", {})
+    if a.cmd == "day":
+        if already_ran_today():
+            print("autopilot: already ran today, nothing to do.", flush=True)
+            return 0
+        if (now_et().hour, now_et().minute) < (9, 0):
+            print("autopilot: before 9:00 New York (the 15:00 SAST fire in winter), the next fire does it.", flush=True)
+            return 0
+    state = morning(a.root, day_started=a.cmd == "day") if a.cmd in ("day", "morning") else load_json("trader/state/autopilot.json", {})
     for s in state.get("steps", []):
-        print("%-7s %s %ss" % (s["name"], "ok" if s["ok"] else "FAIL rc=%s" % s["rc"], s["seconds"]))
-    print("picks: " + ", ".join(p["symbol"] for p in state.get("picks", [])))
+        print("%-7s %s %ss" % (s["name"], "ok" if s["ok"] else "FAIL rc=%s" % s["rc"], s["seconds"]), flush=True)
+    print("picks: " + ", ".join(p["symbol"] for p in state.get("picks", [])), flush=True)
     if a.cmd == "morning":
         return 0
     cfg = load_json("trader/config.json", {})
