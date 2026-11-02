@@ -186,7 +186,10 @@ def portfolio_age_hours(path="trader/portfolio.json", now=None):
     return round(((now or datetime.datetime.now(datetime.timezone.utc)) - t).total_seconds() / 3600, 1)
 
 
-def decide(root, trigger, runner=subprocess.run, now=None, notifier=notify):
+BAR_LAG_WAIT = 60   # seconds: Yahoo posts a 5-minute bar a little after it closes
+
+
+def decide(root, trigger, runner=subprocess.run, now=None, notifier=notify, sleep=time.sleep):
     """Trigger -> the whole pre-order chain -> trader/decision.json. Never orders."""
     os.chdir(root)
     sym = trigger["symbol"]
@@ -200,6 +203,11 @@ def decide(root, trigger, runner=subprocess.run, now=None, notifier=notify):
     steps, risk, ticket_text = [], None, ""
     for name, argv in chain:
         r = run_step(name, argv, timeout=600, runner=runner, ok_rcs=VERDICT_RC if name in ("check", "ticket") else (0,))
+        if name == "timemachine" and not r["ok"] and "not in the data" in r["tail"]:
+            # the trigger fired on a bar the feed had not posted yet (PWP, 2026-11-02); once more after a wait
+            sleep(BAR_LAG_WAIT)
+            r = run_step(name, argv, timeout=600, runner=runner)
+            r["retried"] = True
         steps.append(r)
         if name == "check":
             try:

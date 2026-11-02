@@ -235,6 +235,22 @@ class Decide(unittest.TestCase):
         self.assertEqual(card["status"], "stale_account")
         self.assertGreater(card["portfolio_age_hours"], 24)
 
+    def test_decide_retries_timemachine_once_when_the_bar_is_not_posted_yet(self):
+        inner = chain_runner({"pass": 1, "block": 0, "results": [{"verdict": "PASS"}]})
+        tm_calls, naps = [], []
+
+        def fake(argv, **kw):
+            if os.path.basename(argv[1]) == "timemachine.py":
+                tm_calls.append(argv)
+                if len(tm_calls) == 1:
+                    return types.SimpleNamespace(returncode=1, stdout="", stderr="timemachine.py: the entry is not in the data: no complete 09:45 bar")
+            return inner(argv, **kw)
+        card = ap.decide(self.d, self.TRIG, runner=fake, notifier=lambda *a: None, sleep=naps.append)
+        self.assertEqual(card["status"], "ready")
+        self.assertEqual(len(tm_calls), 2)
+        self.assertEqual(naps, [ap.BAR_LAG_WAIT])
+        self.assertTrue(card["steps"][1]["retried"])
+
     def test_decide_marks_error_when_a_step_fails(self):
         def fake(argv, **kw):
             return types.SimpleNamespace(returncode=1, stdout="", stderr="no plan")
