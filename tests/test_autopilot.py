@@ -326,6 +326,69 @@ class Trade(unittest.TestCase):
         self.assertFalse(card.get("unprotected"))
 
 
+class DayLoop(unittest.TestCase):
+    """Every pick that triggers trades, once, until the cap; open positions settle together."""
+
+    def setUp(self):
+        self.cwd = os.getcwd()
+
+    def tearDown(self):
+        os.chdir(self.cwd)
+
+    def run_loop(self, cfg, triggers=("A", "B", "C"), decide_status="ready"):
+        clock = iter([T1000] * 40 + [T1531] * 40)
+        decided, traded, settled = [], [], []
+
+        def entry(argv, **kw):
+            sym = argv[3]
+            st = "triggered" if sym in triggers else "waiting"
+            return ok(json.dumps({"symbol": sym, "status": st, "minutes_since": 1}))
+
+        def decide_fn(root, trig):
+            decided.append(trig["symbol"])
+            return {"symbol": trig["symbol"], "status": decide_status}
+
+        def trade_fn(root, card, cfg, ib=None, **kw):
+            traded.append(card["symbol"])
+            return dict(card, status="placed", broker={"bracket": {}})
+
+        def settle_fn(root, cards, cfg, ib, **kw):
+            settled.extend(c["symbol"] for c in cards)
+            return [dict(c, status="closed", outcome="target") for c in cards]
+        rc = ap.day_loop(".", PICKS, cfg, every=0, connect=lambda c: "ib", now_fn=lambda: next(clock), runner=entry,
+                         decide_fn=decide_fn, trade_fn=trade_fn, settle_fn=settle_fn, notifier=lambda *a: None)
+        return rc, decided, traded, settled
+
+    def test_every_trigger_trades_once_then_all_settle(self):
+        rc, decided, traded, settled = self.run_loop({"paper": True, "auto_place": True, "max_trades_per_day": 3, "no_entries_after": "15:30"})
+        self.assertEqual((rc, decided, traded, settled), (0, ["A", "B", "C"], ["A", "B", "C"], ["A", "B", "C"]))
+
+    def test_cap_stops_the_day(self):
+        rc, decided, traded, settled = self.run_loop({"paper": True, "auto_place": True, "max_trades_per_day": 2, "no_entries_after": "15:30"})
+        self.assertEqual((traded, settled), (["A", "B"], ["A", "B"]))
+
+    def test_blocked_symbol_is_not_retried_and_nothing_settles(self):
+        rc, decided, traded, settled = self.run_loop({"paper": True, "auto_place": True, "max_trades_per_day": 3, "no_entries_after": "15:30"},
+                                                     decide_status="blocked")
+        self.assertEqual((decided, traded, settled), (["A", "B", "C"], [], []))
+
+    def test_without_auto_place_only_cards(self):
+        rc, decided, traded, settled = self.run_loop({"paper": True, "max_trades_per_day": 3, "no_entries_after": "15:30"})
+        self.assertEqual((decided, traded), (["A", "B", "C"], []))
+
+
+class TradeOpen(Trade):
+    def test_trade_with_shared_ib_returns_placed_and_settle_all_closes(self):
+        ib = FakeIB(); ib.script += [("fill", 16, 168.79), ("fill_sell", "stop", 16, 166.40)]
+        card = ap.trade(self.d, dict(self.card), self.cfg, ib=ib, now_fn=lambda: "10:40", notifier=lambda t, b: self.notes.append((t, b)))
+        self.assertEqual(card["status"], "placed")
+        self.assertEqual(self.read("trader/portfolio.json")["positions"][0]["shares"], 16)
+        done = ap.settle_all(self.d, [card], self.cfg, ib, now_fn=lambda: "10:40", notifier=lambda t, b: self.notes.append((t, b)))
+        self.assertEqual((done[0]["status"], done[0]["outcome"]), ("closed", "stopped"))
+        self.assertEqual(self.read("trader/portfolio.json")["positions"], [])
+        self.assertIsNone(ib.connected_to)
+
+
 class Dashboard(unittest.TestCase):
     def test_dashboard_snapshot_includes_decision(self):
         import importlib.util

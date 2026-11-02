@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Autopilot (trader-autopilot): runs the morning steps, watches the top picks,
-and builds a decision card when one triggers. Standard library only.
+"""Autopilot (trader-autopilot): runs the morning steps, watches every scan hit,
+and builds a decision card for each one that triggers. Standard library only.
 
     python3 day-trader-skill/trader-autopilot/autopilot.py day       # morning, then watch
     python3 day-trader-skill/trader-autopilot/autopilot.py morning   # regime, daily scan, news -> picks
@@ -10,7 +10,9 @@ By default it never places an order: the chain stops at check.py + ticket.py sho
 and the card it writes (trader/decision.json) is what you look at before saying yes.
 With "auto_place": true and "paper": true in trader/config.json it goes on to place
 the entry at IBKR through the TWS API (ibkr_tws.py), attaches the OCA stop + target
-from the real fill, and holds until one fills or flat_by, then sells at market.
+from the real fill, then keeps watching the other hits until no_entries_after or
+max_trades_per_day; every open position is held until its stop or target fills, or
+flat_by, then sold at market.
 Launchd cannot enter the external volume, so the script does the chdir itself.
 """
 
@@ -101,12 +103,12 @@ def load_json(path, default=None):
         return default
 
 
-def rank_picks(watchlist, n=5):
+def rank_picks(watchlist, n=None):
     hits = (watchlist or {}).get("hits") or []
     rows = [{"symbol": h["symbol"], "quality": (h.get("jev") or {}).get("quality"), "setups": h.get("setups", [])}
             for h in hits if h.get("symbol")]
     rows.sort(key=lambda r: -(r["quality"] if r["quality"] is not None else -1e9))
-    return rows[:n]
+    return rows[:n] if n else rows
 
 
 def morning(root, runner=subprocess.run, now=None, day_started=False):
@@ -251,44 +253,61 @@ def _tws():
     return _tool("trader-broker", "ibkr_tws")
 
 
-def trade(root, card, cfg, connect=None, now_fn=now_et, notifier=notify):
-    """A ready card -> entry + OCA bracket at IBKR -> hold to the exit -> fills booked. Paper only, opt in."""
+STATE_PATH, PF_PATH = "trader/state/broker.json", "trader/portfolio.json"
+
+
+def _today(now_fn):
+    t = now_fn()
+    return t.date().isoformat() if hasattr(t, "date") else datetime.date.today().isoformat()
+
+
+def _fail(card, notifier, msg, unprotected=False):
+    sym = card["symbol"]
+    card.update({"status": "broker_error", "error": str(msg), "unprotected": unprotected})
+    write_json("trader/decision.json", card)
+    notifier("Autopilot: %s broker error" % sym,
+             ("%s is open with NO stop: %s" % (sym, msg)) if unprotected else str(msg))
+    return card
+
+
+def _booker(ticket, cfg, sym, today):
+    def book(side, qty, price):
+        now = datetime.datetime.now(datetime.timezone.utc)
+        ticket.apply_fill(PF_PATH, cfg, sym, side, qty, price, today)
+        ticket.log_fill(STATE_PATH, now, today, sym, side, qty, price)
+    return book
+
+
+def trade(root, card, cfg, connect=None, now_fn=now_et, notifier=notify, ib=None):
+    """A ready card -> entry + OCA bracket at IBKR. Paper only, opt in.
+    With an open `ib` the card comes back "placed" for settle() later; without one it
+    connects itself and settles to the exit."""
     if card.get("status") != "ready" or not (cfg.get("auto_place") and cfg.get("paper") is True):
         return card
     os.chdir(root)
     tws, ticket = _tws(), _ticket()
     sym = card["symbol"]
     order = ((load_json("trader/orders.json", {}) or {}).get("orders") or [{}])[0]
-    t = now_fn()
-    today = t.date().isoformat() if hasattr(t, "date") else datetime.date.today().isoformat()
-    state_path, pf_path = "trader/state/broker.json", "trader/portfolio.json"
+    today = _today(now_fn)
+    fail = lambda msg, unprotected=False: _fail(card, notifier, msg, unprotected)
+    book = _booker(ticket, cfg, sym, today)
 
-    def fail(msg, unprotected=False):
-        card.update({"status": "broker_error", "error": str(msg), "unprotected": unprotected})
-        write_json("trader/decision.json", card)
-        notifier("Autopilot: %s broker error" % sym,
-                 ("%s is open with NO stop: %s" % (sym, msg)) if unprotected else str(msg))
-        return card
-
-    def book(side, qty, price):
-        now = datetime.datetime.now(datetime.timezone.utc)
-        ticket.apply_fill(pf_path, cfg, sym, side, qty, price, today)
-        ticket.log_fill(state_path, now, today, sym, side, qty, price)
-
-    try:
-        ib = (connect or tws.connect)(cfg)
-    except Exception as e:
-        return fail(e)
+    own = ib is None
+    if own:
+        try:
+            ib = (connect or tws.connect)(cfg)
+        except Exception as e:
+            return fail(e)
     try:
         entry = tws.place_entry(ib, order)
     except Exception as e:
         return fail(e)
-    st = ticket.load_state(state_path)
+    st = ticket.load_state(STATE_PATH)
     st.setdefault("orders", []).append({"at": ticket.ny_iso(datetime.datetime.now(datetime.timezone.utc)), "date": today,
                                         "status": "placed", "symbol": sym, "side": order.get("side", "buy"),
                                         "qty": str(order.get("qty")), "broker_order_id": entry["order_id"],
                                         "plain": "BUY %s %s, market, day (autopilot via TWS)" % (order.get("qty"), sym)})
-    write_json(state_path, st)
+    write_json(STATE_PATH, st)
     book("buy", entry["filled_qty"], entry["fill_price"])
     try:
         bracket = tws.attach_bracket(ib, order, entry["filled_qty"], entry["fill_price"], date=today,
@@ -299,19 +318,45 @@ def trade(root, card, cfg, connect=None, now_fn=now_et, notifier=notify):
     write_json("trader/decision.json", card)
     notifier("Autopilot: %s placed" % sym, "%s %s at %.2f, stop %.2f, target %.2f" % (
         sym, _str(entry["filled_qty"]), entry["fill_price"], bracket["stop"], bracket["target"]))
+    if not own:
+        return card
     try:
-        r = tws.hold(ib, bracket, cfg.get("flat_by") or "15:55", now_fn, on_fill=book)
-    except Exception as e:
-        return fail(e, unprotected=True)
+        return settle(root, card, cfg, ib, now_fn=now_fn, notifier=notifier)
     finally:
-        try:
-            ib.disconnect()
-        except Exception:
-            pass
+        _disconnect(ib)
+
+
+def settle(root, card, cfg, ib, now_fn=now_et, notifier=notify):
+    """A placed card -> hold to the stop, the target or flat_by -> the exit booked."""
+    os.chdir(root)
+    tws, ticket = _tws(), _ticket()
+    sym = card["symbol"]
+    book = _booker(ticket, cfg, sym, _today(now_fn))
+    try:
+        r = tws.hold(ib, card["broker"]["bracket"], cfg.get("flat_by") or "15:55", now_fn, on_fill=book)
+    except Exception as e:
+        return _fail(card, notifier, e, unprotected=True)
     card.update({"status": "closed", "outcome": r["outcome"], "exit": r})
     write_json("trader/decision.json", card)
     notifier("Autopilot: %s %s" % (sym, r["outcome"]), "%s sold %s at %.2f" % (sym, _str(r["qty"]), r["price"]))
     return card
+
+
+def settle_all(root, cards, cfg, ib, now_fn=now_et, notifier=notify):
+    """Every placed card to its exit, then disconnect. The brackets live at IBKR, so a
+    position that exits while an earlier one is still held is booked when its turn comes."""
+    # ponytail: sequential holds; one poll over all brackets if the late booking ever matters
+    try:
+        return [settle(root, c, cfg, ib, now_fn=now_fn, notifier=notifier) for c in cards]
+    finally:
+        _disconnect(ib)
+
+
+def _disconnect(ib):
+    try:
+        ib.disconnect()
+    except Exception:
+        pass
 
 
 def _str(q):
@@ -343,16 +388,48 @@ def main(argv=None):
     if a.cmd == "morning":
         return 0
     cfg = load_json("trader/config.json", {})
-    trig = watch(a.root, state.get("picks", []), until=entry_cutoff(cfg), every=a.every)
-    print("trigger: %s" % (trig["symbol"] if trig else "none"))
-    if trig:
-        card = decide(a.root, trig)
+    return day_loop(a.root, state.get("picks", []), cfg, every=a.every)
+
+
+def day_loop(root, picks, cfg, every=60, connect=None, now_fn=now_et, runner=subprocess.run,
+             decide_fn=None, trade_fn=None, settle_fn=None, notifier=notify):
+    """Watch every pick; each fresh trigger gets its own decision and trade, until the entry
+    cutoff or max_trades_per_day. A symbol is tried once a day. Open positions settle at the end."""
+    decide_fn, trade_fn, settle_fn = decide_fn or decide, trade_fn or trade, settle_fn or settle_all
+    cap = int(cfg.get("max_trades_per_day") or 0)
+    tried, placed, ib, rc = set(), [], None, 0
+    while not (cap and len(placed) >= cap):
+        todo = [p for p in picks if p["symbol"] not in tried]
+        trig = watch(root, todo, until=entry_cutoff(cfg), every=every, runner=runner, now_fn=now_fn) if todo else None
+        print("trigger: %s" % (trig["symbol"] if trig else "none"))
+        if not trig:
+            break
+        tried.add(trig["symbol"])
+        card = decide_fn(root, trig)
         print("decision: %s %s -> trader/decision.json" % (card["symbol"], card["status"]))
-        card = trade(a.root, card, cfg)
-        print("trade: %s %s%s" % (card["symbol"], card["status"], " " + card["outcome"] if card.get("outcome") else ""))
-        if card["status"] == "broker_error":
-            return 2
-    return 0
+        if card["status"] != "ready" or not (cfg.get("auto_place") and cfg.get("paper") is True):
+            continue
+        if ib is None:
+            try:
+                ib = (connect or _tws().connect)(cfg)
+            except Exception as e:
+                _fail(card, notifier, e)
+                print("trade: %s broker_error" % card["symbol"])
+                return 2
+        card = trade_fn(root, card, cfg, ib=ib, now_fn=now_fn, notifier=notifier)
+        print("trade: %s %s" % (card["symbol"], card["status"]))
+        if card["status"] == "placed":
+            placed.append(card)
+        else:
+            rc = 2
+            if card.get("unprotected"):
+                break
+    if ib is not None:
+        for card in settle_fn(root, placed, cfg, ib, now_fn=now_fn, notifier=notifier):
+            print("exit: %s %s%s" % (card["symbol"], card["status"], " " + card["outcome"] if card.get("outcome") else ""))
+            if card["status"] == "broker_error":
+                rc = 2
+    return rc
 
 
 if __name__ == "__main__":

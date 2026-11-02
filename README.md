@@ -72,7 +72,7 @@ or in the `SEC_USER_AGENT` environment variable.
 | `/trader-alerts` | Price Alerts | Rings when a price, a stop or the opening bell hits. |
 | `/trader-analyst` | Earnings Analyst | Reads earnings reports and sums up what changed. |
 | `/trader-pelosi` | Pelosi Tracker | Reads Congress's stock-trade disclosures the minute they are filed. |
-| `/trader-autopilot` | Autopilot | Runs the morning steps on a schedule, watches the top picks, and puts a decision card on the dashboard. Never places an order. |
+| `/trader-autopilot` | Autopilot | Runs the morning steps on a schedule, watches every scan hit, and trades each one that triggers and passes the gates, up to max_trades_per_day. Places orders only on paper with auto_place. |
 
 ## How to use it
 
@@ -80,7 +80,7 @@ Everything lands in a `trader/` folder in your project, and each skill reads
 what the last one wrote:
 
 ```
-scanner -> news -> entry -> exit -> timemachine -> budget -> risk -> broker   (one trade)
+scanner -> news -> entry -> exit -> timemachine -> budget -> risk -> broker   (per trigger, up to max_trades_per_day)
 alerts: stop, target, flat by the close                                       (while it is open)
 news / analyst / pelosi                                                        (on a schedule)
 ```
